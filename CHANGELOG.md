@@ -16,18 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `.md` files in those directories so the dump stays in sync with the
   database; other files are left untouched.
 
-### Fixed
-
-- `kb.delete` on an entity no longer fails with a foreign-key error: it now
-  cascades to the entity's statements and relationships, cleaning their search
-  index entries, journal links, and inbound redirects, and records the cascade
-  in the audit journal entry.
-- `memory.recent` no longer silently drops records that share a `created_at`
-  with a page boundary. Paging now uses a compound cursor: pass the returned
-  `next_before` and `next_before_id` back as `before` and `before_id`.
-- A busy checkpoint or vacuum after `kb.delete` is no longer reported as a
-  failed deletion; the result now carries `vacuum_completed` instead.
-
 ### Changed
 
 - Schema v2: search indexes are project-scoped. The vector index is
@@ -43,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory.recent` pages via SQL ordering and aggregates instead of loading
   whole tables into memory.
 - Deletion audit journal entries are now keyword-searchable.
+
+### Fixed
+
+- `kb.delete` on an entity no longer fails with a foreign-key error: it now
+  cascades to the entity's statements and relationships, cleaning their search
+  index entries, journal links, and inbound redirects, records the cascade in
+  the audit journal entry, and reports `cascaded_statements` and
+  `cascaded_relationships` in the result.
+- `memory.recent` no longer silently drops records that share a `created_at`
+  with a page boundary. Paging now uses a compound cursor: pass the returned
+  `next_before` and `next_before_id` back as `before` and `before_id`.
+- A busy checkpoint or vacuum after `kb.delete` is no longer reported as a
+  failed deletion; the result now carries `vacuum_completed` instead.
 
 ## [0.1.0] - 2026-06-25
 
