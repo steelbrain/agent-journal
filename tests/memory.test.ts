@@ -35,7 +35,7 @@ function makeApi(cwd = process.cwd(), random = () => 1) {
 
 async function seedStatement(api: MemoryApi, overrides: Partial<Record<string, unknown>> = {}) {
   const project = typeof overrides.project === 'string' ? { project: overrides.project } : {};
-  const entity = api.upsertEntity({ type: 'Service', title: 'Auth API', tags: ['auth'], ...project });
+  const entity = await api.upsertEntity({ type: 'Service', title: 'Auth API', tags: ['auth'], ...project });
   const added = await api.addStatement({
     entity_id: entity.id,
     claim: 'Auth API runs on Node 20',
@@ -60,18 +60,80 @@ afterEach(() => {
 });
 
 describe('database initialization', () => {
-  it('creates the v0 schema with incremental auto vacuum and WAL', () => {
+  it('creates the current schema with incremental auto vacuum and WAL', () => {
     const { dbFile, db } = makeApi();
 
     expect(db.pragma('auto_vacuum', { simple: true })).toBe(2);
     expect(db.pragma('journal_mode', { simple: true })).toBe('wal');
-    expect(db.pragma('user_version', { simple: true })).toBe(1);
+    expect(db.pragma('user_version', { simple: true })).toBe(2);
     db.close();
 
     const reopened = openDb(dbFile);
     expect(reopened.pragma('auto_vacuum', { simple: true })).toBe(2);
     expect(reopened.pragma('journal_mode', { simple: true })).toBe('wal');
-    expect(reopened.pragma('user_version', { simple: true })).toBe(1);
+    expect(reopened.pragma('user_version', { simple: true })).toBe(2);
+    reopened.close();
+  });
+
+  it('migrates a v1 database to the project-scoped v2 search indexes', async () => {
+    const { dbFile, db, api } = makeApi();
+    const { statement } = await seedStatement(api);
+    await api.appendJournal({ narrative: 'Investigated the auth flow end to end' });
+
+    // Downgrade to the v1 index shape: global vec/fts tables and user_version 1.
+    const vecRows = db
+      .prepare(
+        'SELECT e.owner_type, e.owner_id, v.embedding AS embedding FROM embedding e JOIN vec_index v ON v.rowid = e.vec_rowid',
+      )
+      .all() as Array<{ owner_type: string; owner_id: string; embedding: Buffer }>;
+    db.exec(`
+      DROP TABLE vec_index;
+      CREATE VIRTUAL TABLE vec_index USING vec0(embedding float[384]);
+      DROP TABLE fts_statements;
+      CREATE VIRTUAL TABLE fts_statements USING fts5(statement_id UNINDEXED, claim, entity_title);
+      DROP TABLE fts_journal;
+      CREATE VIRTUAL TABLE fts_journal USING fts5(journal_id UNINDEXED, narrative, commands);
+    `);
+    const insertVec = db.prepare('INSERT INTO vec_index(embedding) VALUES (?)');
+    const remap = db.prepare('UPDATE embedding SET vec_rowid = ? WHERE owner_type = ? AND owner_id = ?');
+    for (const row of vecRows) {
+      const inserted = insertVec.run(row.embedding);
+      remap.run(Number(inserted.lastInsertRowid), row.owner_type, row.owner_id);
+    }
+    db.exec(`
+      INSERT INTO fts_statements(statement_id, claim, entity_title)
+        SELECT s.id, s.claim, e.title FROM statement s JOIN entity e ON e.id = s.entity_id;
+      INSERT INTO fts_journal(journal_id, narrative, commands)
+        SELECT id, narrative, COALESCE(commands, '') FROM journal_entry WHERE narrative IS NOT NULL AND narrative != '';
+    `);
+    db.pragma('user_version = 1');
+    db.close();
+
+    const reopened = openDb(dbFile);
+    expect(reopened.pragma('user_version', { simple: true })).toBe(2);
+
+    // Every embedding maps to a vec row that carries the owner's scoping.
+    const mapped = reopened
+      .prepare(
+        `SELECT COUNT(*) AS count FROM embedding e
+         JOIN vec_index v ON v.rowid = e.vec_rowid
+         WHERE v.owner_type = e.owner_type AND v.project_id IS NOT NULL AND v.status IS NOT NULL`,
+      )
+      .get() as { count: number };
+    const total = reopened.prepare('SELECT COUNT(*) AS count FROM embedding').get() as { count: number };
+    expect(total.count).toBeGreaterThan(0);
+    expect(mapped.count).toBe(total.count);
+
+    const migrated = new MemoryApi({
+      db: reopened,
+      resolver: new ProjectResolver(reopened, process.cwd()),
+      embeddings: new HashEmbeddings(),
+      dbFile,
+    });
+    const kb = await migrated.search({ query: 'Node 20', where: 'knowledge-base' });
+    expect(kb.entities.flatMap((group) => group.statements.map((hit) => hit.id))).toContain(statement.id);
+    const journal = await migrated.search({ query: 'auth flow', where: 'journal' });
+    expect(journal.journal.length).toBeGreaterThan(0);
     reopened.close();
   });
 });
@@ -104,7 +166,7 @@ describe('tool contracts', () => {
 
   it('enforces the statement confidence contract', async () => {
     const { api } = makeApi();
-    const entity = api.upsertEntity({ type: 'Service', title: 'Auth API' });
+    const entity = await api.upsertEntity({ type: 'Service', title: 'Auth API' });
     await expect(
       api.addStatement({
         entity_id: entity.id,
@@ -226,7 +288,7 @@ describe('statement lifecycle', () => {
 
   it('creates an auto-stub journal without explicit provenance and skips it with an explicit journal', async () => {
     const { db, api } = makeApi();
-    const entity = api.upsertEntity({ type: 'Service', title: 'Auth API' });
+    const entity = await api.upsertEntity({ type: 'Service', title: 'Auth API' });
 
     const first = await api.addStatement({
       entity_id: entity.id,
@@ -270,7 +332,7 @@ describe('statement lifecycle', () => {
       derivation_method: 'user-assertion',
     });
 
-    const other = api.upsertEntity({ type: 'Service', title: 'Billing API' });
+    const other = await api.upsertEntity({ type: 'Service', title: 'Billing API' });
     const otherStatement = await api.addStatement({
       entity_id: other.id,
       claim: 'Billing API runs on Node 20',
@@ -300,6 +362,59 @@ describe('statement lifecycle', () => {
     });
   });
 
+  it('re-keys and re-embeds statement search entries when the entity title changes', async () => {
+    const { db, api, embeddings } = makeApi();
+    const { entity, statement } = await seedStatement(api);
+
+    await api.upsertEntity({ id: entity.id, type: 'Service', title: 'Identity API' });
+
+    expect(db.prepare('SELECT entity_title FROM fts_statements WHERE statement_id = ?').get(statement.id)).toEqual({
+      entity_title: 'Identity API',
+    });
+    const embeddingRow = db
+      .prepare("SELECT content_hash FROM embedding WHERE owner_type = 'statement' AND owner_id = ?")
+      .get(statement.id) as { content_hash: string };
+    expect(embeddingRow.content_hash).toBe(embeddings.contentHash('Auth API runs on Node 20\nIdentity API'));
+  });
+
+  it('mirrors invalidation and supersession into the search index status columns', async () => {
+    const { db, api } = makeApi();
+    const { entity, statement } = await seedStatement(api);
+    const second = await api.addStatement({
+      entity_id: entity.id,
+      claim: 'Auth API exposes /health',
+      confidence_level: 'high',
+      confidence_reason: 'fixture',
+      derivation_method: 'user-assertion',
+    });
+
+    await api.invalidate({ id: statement.id, note: 'stale' });
+    expect(db.prepare('SELECT status FROM fts_statements WHERE statement_id = ?').get(statement.id)).toEqual({
+      status: 'invalid',
+    });
+    expect(
+      db
+        .prepare(
+          "SELECT v.status AS status FROM vec_index v JOIN embedding e ON e.vec_rowid = v.rowid WHERE e.owner_type = 'statement' AND e.owner_id = ?",
+        )
+        .get(statement.id),
+    ).toEqual({ status: 'invalid' });
+
+    const edited = await api.editStatement({ statement_id: second.statement.id, claim: 'Auth API exposes /healthz' });
+    expect(db.prepare('SELECT status FROM fts_statements WHERE statement_id = ?').get(second.statement.id)).toEqual({
+      status: 'invalid',
+    });
+    expect(db.prepare('SELECT status FROM fts_statements WHERE statement_id = ?').get(edited.statement.id)).toEqual({
+      status: 'active',
+    });
+
+    // Entity invalidation cascades the status flip to its active statements.
+    await api.invalidate({ id: entity.id, note: 'decommissioned' });
+    expect(db.prepare('SELECT status FROM fts_statements WHERE statement_id = ?').get(edited.statement.id)).toEqual({
+      status: 'invalid',
+    });
+  });
+
   it('does not re-stamp already-invalid statements when the entity is invalidated', async () => {
     const { db, api } = makeApi();
     const { entity, statement } = await seedStatement(api);
@@ -319,7 +434,7 @@ describe('statement lifecycle', () => {
 describe('search ranking and chronology', () => {
   it('scores recency and trust according to the configured formula', async () => {
     const { db, api } = makeApi();
-    const entity = api.upsertEntity({ type: 'Service', title: 'Auth API' });
+    const entity = await api.upsertEntity({ type: 'Service', title: 'Auth API' });
     const oldLow = await api.addStatement({
       entity_id: entity.id,
       claim: 'Auth API listens on port 3000',
@@ -369,6 +484,39 @@ describe('search ranking and chronology', () => {
     const next = api.recent({ where: 'knowledge-base', before: page.next_before!, limit: 2 });
     expect(next.items.map((item) => item.id)).toEqual([one.entity.id]);
   });
+
+  it('does not drop records that share a created_at across page boundaries', async () => {
+    const { api } = makeApi();
+    const entity = await api.upsertEntity({ type: 'Service', title: 'Tie Service' });
+    // Each addStatement writes the statement and its auto-stub journal with
+    // one shared timestamp, so created_at ties are the normal case here.
+    for (let i = 0; i < 3; i += 1) {
+      await api.addStatement({
+        entity_id: entity.id,
+        claim: `tie fact ${i}`,
+        confidence_level: 'low',
+        confidence_reason: 'fixture',
+        derivation_method: 'inference',
+      });
+    }
+
+    const all = api.recent({ where: 'both', limit: 100 });
+    expect(all.items.length).toBe(7);
+
+    const paged: string[] = [];
+    let before: number | undefined;
+    let beforeId: string | undefined;
+    for (;;) {
+      const page = api.recent({ where: 'both', limit: 3, before, before_id: beforeId });
+      paged.push(...page.items.map((item) => item.id));
+      if (page.next_before === null) break;
+      before = page.next_before;
+      beforeId = page.next_before_id ?? undefined;
+    }
+
+    expect(paged).toHaveLength(all.items.length);
+    expect([...paged].sort()).toEqual(all.items.map((item) => item.id).sort());
+  });
 });
 
 describe('deletion and vacuuming', () => {
@@ -389,6 +537,7 @@ describe('deletion and vacuuming', () => {
 
     const deleted = api.delete({ id: first.statement.id, reason: 'contained poisoned content' });
     expect(deleted.target_type).toBe('statement');
+    expect(deleted.vacuum_completed).toBe(true);
     expect(db.prepare('SELECT * FROM statement WHERE id = ?').get(first.statement.id)).toBeUndefined();
     expect(db.prepare('SELECT * FROM embedding WHERE owner_id = ?').get(first.statement.id)).toBeUndefined();
     expect(
@@ -427,6 +576,83 @@ describe('deletion and vacuuming', () => {
     expect(after).toBeLessThanOrEqual(before);
   });
 
+  it('hard-deletes an entity together with its statements and cleans their indexes', async () => {
+    const { db, api } = makeApi();
+    const { entity, statement } = await seedStatement(api);
+    const second = await api.addStatement({
+      entity_id: entity.id,
+      claim: 'Second poisoned fact',
+      confidence_level: 'high',
+      confidence_reason: 'fixture',
+      derivation_method: 'user-assertion',
+    });
+    await api.invalidate({ id: second.statement.id, note: 'stale' });
+
+    const other = await api.upsertEntity({ type: 'Service', title: 'Billing API' });
+    const inbound = await api.addStatement({
+      entity_id: other.id,
+      claim: 'Billing depends on auth',
+      confidence_level: 'high',
+      confidence_reason: 'fixture',
+      derivation_method: 'user-assertion',
+    });
+    db.prepare('UPDATE statement SET superseded_by = ? WHERE id = ?').run(statement.id, inbound.statement.id);
+
+    const deleted = api.delete({ id: entity.id, reason: 'entity content was poisoned' }) as {
+      target_type: string;
+      journal_entry_id: string;
+      cascaded_statements: number;
+      cascaded_relationships: number;
+      vacuum_completed: boolean;
+    };
+
+    expect(deleted.target_type).toBe('entity');
+    expect(deleted.cascaded_statements).toBe(2);
+    expect(deleted.cascaded_relationships).toBe(0);
+    expect(deleted.vacuum_completed).toBe(true);
+
+    expect(db.prepare('SELECT COUNT(*) AS count FROM entity WHERE id = ?').get(entity.id)).toEqual({ count: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM statement WHERE entity_id = ?').get(entity.id)).toEqual({
+      count: 0,
+    });
+    expect(
+      db
+        .prepare('SELECT COUNT(*) AS count FROM fts_statements WHERE statement_id IN (?, ?)')
+        .get(statement.id, second.statement.id),
+    ).toEqual({ count: 0 });
+    expect(
+      db
+        .prepare("SELECT COUNT(*) AS count FROM embedding WHERE owner_type = 'statement' AND owner_id IN (?, ?)")
+        .get(statement.id, second.statement.id),
+    ).toEqual({ count: 0 });
+
+    // The audit entry links the entity and every cascaded statement with role
+    // "deleted"; all other links to the deleted statements are dropped.
+    expect(
+      db
+        .prepare("SELECT COUNT(*) AS count FROM journal_link WHERE journal_id = ? AND role = 'deleted'")
+        .get(deleted.journal_entry_id),
+    ).toEqual({ count: 3 });
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM journal_link WHERE target_type = 'statement' AND target_id IN (?, ?) AND journal_id != ?",
+        )
+        .get(statement.id, second.statement.id, deleted.journal_entry_id),
+    ).toEqual({ count: 0 });
+
+    // The inbound redirect from the surviving statement is cleared.
+    const survivor = db
+      .prepare('SELECT superseded_by, invalidation_note FROM statement WHERE id = ?')
+      .get(inbound.statement.id) as { superseded_by: string | null; invalidation_note: string | null };
+    expect(survivor.superseded_by).toBeNull();
+    expect(survivor.invalidation_note).toContain(`redirect target deleted ${statement.id}`);
+
+    // The deletion reason is keyword-searchable in the journal.
+    const audit = await api.search({ query: 'poisoned', where: 'journal' });
+    expect(audit.journal.map((hit) => hit.id)).toContain(deleted.journal_entry_id);
+  });
+
   it('hard-deletes journal entries without spawning a new journal entry', async () => {
     const { db, api } = makeApi();
     const journal = await api.appendJournal({ narrative: 'Temporary journal content' });
@@ -447,6 +673,53 @@ describe('deletion and vacuuming', () => {
         .prepare('SELECT COUNT(*) AS count FROM journal_link WHERE journal_id = ? OR target_id = ?')
         .get(journal.id, journal.id),
     ).toEqual({ count: 0 });
+  });
+});
+
+describe('search recall scoping', () => {
+  it('scopes recall budgets per project so busy projects cannot starve quiet ones', async () => {
+    const { db, api } = makeApi();
+    for (let i = 0; i < 3; i += 1) {
+      await seedStatement(api, { project: 'busy', claim: 'redis cache connection timeout' });
+    }
+    const quiet = await seedStatement(api, { project: 'quiet', claim: 'redis cache connection timeout' });
+    // A recall budget smaller than the busy project's row count: pre-scoping,
+    // the busy rows would consume the global pool and the quiet project's own
+    // fact could never surface.
+    db.prepare("UPDATE project SET config = ? WHERE resolution_key = 'quiet'").run(
+      JSON.stringify({ k_recall_fts: 2, k_recall_vec: 2 }),
+    );
+
+    const result = await api.search({
+      query: 'redis cache connection timeout',
+      where: 'knowledge-base',
+      project: 'quiet',
+    });
+    const ids = result.entities.flatMap((group) => group.statements.map((hit) => hit.id));
+    expect(ids).toEqual([quiet.statement.id]);
+  });
+
+  it('keeps tombstones out of the recall budget unless include_invalid is set', async () => {
+    const { db, api } = makeApi();
+    const stale = await seedStatement(api, { project: 'scoped', claim: 'ldap sync worker crashes hourly' });
+    await api.invalidate({ id: stale.statement.id, note: 'fixed upstream', project: 'scoped' });
+    const fresh = await api.addStatement({
+      entity_id: stale.entity.id,
+      claim: 'ldap sync worker crashes hourly under load',
+      confidence_level: 'high',
+      confidence_reason: 'fixture',
+      derivation_method: 'user-assertion',
+      project: 'scoped',
+    });
+    // With a recall budget of one, an invalid row winning the slot would blank
+    // the search entirely if tombstones were still in the pool.
+    db.prepare("UPDATE project SET config = ? WHERE resolution_key = 'scoped'").run(
+      JSON.stringify({ k_recall_fts: 1, k_recall_vec: 1 }),
+    );
+
+    const live = await api.search({ query: 'ldap sync worker crashes', where: 'knowledge-base', project: 'scoped' });
+    const liveIds = live.entities.flatMap((group) => group.statements.map((hit) => hit.id));
+    expect(liveIds).toEqual([fresh.statement.id]);
   });
 });
 

@@ -11,130 +11,187 @@ import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 
 // src/db/migrations.ts
-var VERSION = 1;
+var VERSION = 2;
 function runMigrations(db) {
   const current = db.pragma("user_version", { simple: true });
   if (current >= VERSION) {
     return;
   }
   db.transaction(() => {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS project (
-        id             TEXT PRIMARY KEY,
-        resolution_key TEXT NOT NULL UNIQUE,
-        display_name   TEXT,
-        config         TEXT,
-        created_at     INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS entity (
-        id                TEXT PRIMARY KEY,
-        project_id        TEXT NOT NULL REFERENCES project(id),
-        type              TEXT NOT NULL,
-        title             TEXT NOT NULL,
-        summary           TEXT,
-        tags              TEXT,
-        created_at        INTEGER NOT NULL,
-        last_updated_at   INTEGER NOT NULL,
-        last_accessed_at  INTEGER,
-        status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
-        invalidation_note TEXT,
-        invalidated_at    INTEGER,
-        superseded_by     TEXT REFERENCES entity(id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_entity_project ON entity(project_id, status);
-
-      CREATE TABLE IF NOT EXISTS statement (
-        id                TEXT PRIMARY KEY,
-        project_id        TEXT NOT NULL REFERENCES project(id),
-        entity_id         TEXT NOT NULL REFERENCES entity(id),
-        edge_id           TEXT REFERENCES relationship(id),
-        claim             TEXT NOT NULL,
-        confidence_level  TEXT NOT NULL CHECK (confidence_level IN ('low','medium','high','verified')),
-        confidence_reason TEXT NOT NULL,
-        derivation_method TEXT NOT NULL CHECK (derivation_method IN
-                             ('direct-observation','command-output','user-assertion','inference','external-doc')),
-        citations         TEXT,
-        created_at        INTEGER NOT NULL,
-        last_accessed_at  INTEGER,
-        valid_from        INTEGER,
-        valid_to          INTEGER,
-        status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
-        invalidation_note TEXT,
-        invalidated_at    INTEGER,
-        superseded_by     TEXT REFERENCES statement(id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_stmt_entity   ON statement(entity_id, status);
-      CREATE INDEX IF NOT EXISTS idx_stmt_project  ON statement(project_id, status);
-      CREATE INDEX IF NOT EXISTS idx_stmt_superby  ON statement(superseded_by);
-      CREATE INDEX IF NOT EXISTS idx_stmt_created  ON statement(project_id, created_at);
-
-      CREATE TABLE IF NOT EXISTS relationship (
-        id                TEXT PRIMARY KEY,
-        project_id        TEXT NOT NULL REFERENCES project(id),
-        from_entity       TEXT NOT NULL REFERENCES entity(id),
-        to_entity         TEXT NOT NULL REFERENCES entity(id),
-        type              TEXT NOT NULL,
-        confidence_level  TEXT NOT NULL CHECK (confidence_level IN ('low','medium','high','verified')),
-        confidence_reason TEXT NOT NULL,
-        derivation_method TEXT NOT NULL,
-        citations         TEXT,
-        created_at        INTEGER NOT NULL,
-        last_accessed_at  INTEGER,
-        valid_from        INTEGER,
-        valid_to          INTEGER,
-        status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
-        invalidation_note TEXT,
-        invalidated_at    INTEGER,
-        superseded_by     TEXT REFERENCES relationship(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS journal_entry (
-        id             TEXT PRIMARY KEY,
-        project_id     TEXT NOT NULL REFERENCES project(id),
-        created_at     INTEGER NOT NULL,
-        commands       TEXT,
-        proven         TEXT,
-        disproven      TEXT,
-        narrative      TEXT,
-        is_stub        INTEGER NOT NULL DEFAULT 0,
-        status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
-        superseded_by  TEXT REFERENCES journal_entry(id),
-        invalidated_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_jrnl_project ON journal_entry(project_id, created_at);
-
-      CREATE TABLE IF NOT EXISTS journal_link (
-        journal_id  TEXT NOT NULL REFERENCES journal_entry(id),
-        target_type TEXT NOT NULL CHECK (target_type IN ('entity','statement','relationship','journal_entry')),
-        target_id   TEXT NOT NULL,
-        role        TEXT NOT NULL CHECK (role IN ('created','changed','proven','disproven','deleted')),
-        PRIMARY KEY (journal_id, target_type, target_id, role)
-      );
-      CREATE INDEX IF NOT EXISTS idx_jlink_target ON journal_link(target_type, target_id);
-
-      CREATE TABLE IF NOT EXISTS embedding (
-        owner_type   TEXT NOT NULL CHECK (owner_type IN ('statement','journal_entry')),
-        owner_id     TEXT NOT NULL,
-        vec_rowid    INTEGER NOT NULL,
-        model_id     TEXT NOT NULL,
-        dim          INTEGER NOT NULL,
-        content_hash TEXT NOT NULL,
-        PRIMARY KEY (owner_type, owner_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_emb_vecrow ON embedding(vec_rowid);
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(embedding float[384]);
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS fts_statements USING fts5(
-        statement_id UNINDEXED, claim, entity_title
-      );
-      CREATE VIRTUAL TABLE IF NOT EXISTS fts_journal USING fts5(
-        journal_id UNINDEXED, narrative, commands
-      );
-    `);
+    if (current < 1) migrateV1(db);
+    if (current < 2) migrateV2(db);
     db.pragma(`user_version = ${VERSION}`);
   })();
+}
+function migrateV1(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project (
+      id             TEXT PRIMARY KEY,
+      resolution_key TEXT NOT NULL UNIQUE,
+      display_name   TEXT,
+      config         TEXT,
+      created_at     INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entity (
+      id                TEXT PRIMARY KEY,
+      project_id        TEXT NOT NULL REFERENCES project(id),
+      type              TEXT NOT NULL,
+      title             TEXT NOT NULL,
+      summary           TEXT,
+      tags              TEXT,
+      created_at        INTEGER NOT NULL,
+      last_updated_at   INTEGER NOT NULL,
+      last_accessed_at  INTEGER,
+      status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
+      invalidation_note TEXT,
+      invalidated_at    INTEGER,
+      superseded_by     TEXT REFERENCES entity(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_project ON entity(project_id, status);
+
+    CREATE TABLE IF NOT EXISTS statement (
+      id                TEXT PRIMARY KEY,
+      project_id        TEXT NOT NULL REFERENCES project(id),
+      entity_id         TEXT NOT NULL REFERENCES entity(id),
+      edge_id           TEXT REFERENCES relationship(id),
+      claim             TEXT NOT NULL,
+      confidence_level  TEXT NOT NULL CHECK (confidence_level IN ('low','medium','high','verified')),
+      confidence_reason TEXT NOT NULL,
+      derivation_method TEXT NOT NULL CHECK (derivation_method IN
+                           ('direct-observation','command-output','user-assertion','inference','external-doc')),
+      citations         TEXT,
+      created_at        INTEGER NOT NULL,
+      last_accessed_at  INTEGER,
+      valid_from        INTEGER,
+      valid_to          INTEGER,
+      status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
+      invalidation_note TEXT,
+      invalidated_at    INTEGER,
+      superseded_by     TEXT REFERENCES statement(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_stmt_entity   ON statement(entity_id, status);
+    CREATE INDEX IF NOT EXISTS idx_stmt_project  ON statement(project_id, status);
+    CREATE INDEX IF NOT EXISTS idx_stmt_superby  ON statement(superseded_by);
+    CREATE INDEX IF NOT EXISTS idx_stmt_created  ON statement(project_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS relationship (
+      id                TEXT PRIMARY KEY,
+      project_id        TEXT NOT NULL REFERENCES project(id),
+      from_entity       TEXT NOT NULL REFERENCES entity(id),
+      to_entity         TEXT NOT NULL REFERENCES entity(id),
+      type              TEXT NOT NULL,
+      confidence_level  TEXT NOT NULL CHECK (confidence_level IN ('low','medium','high','verified')),
+      confidence_reason TEXT NOT NULL,
+      derivation_method TEXT NOT NULL,
+      citations         TEXT,
+      created_at        INTEGER NOT NULL,
+      last_accessed_at  INTEGER,
+      valid_from        INTEGER,
+      valid_to          INTEGER,
+      status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
+      invalidation_note TEXT,
+      invalidated_at    INTEGER,
+      superseded_by     TEXT REFERENCES relationship(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS journal_entry (
+      id             TEXT PRIMARY KEY,
+      project_id     TEXT NOT NULL REFERENCES project(id),
+      created_at     INTEGER NOT NULL,
+      commands       TEXT,
+      proven         TEXT,
+      disproven      TEXT,
+      narrative      TEXT,
+      is_stub        INTEGER NOT NULL DEFAULT 0,
+      status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','invalid')),
+      superseded_by  TEXT REFERENCES journal_entry(id),
+      invalidated_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_jrnl_project ON journal_entry(project_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS journal_link (
+      journal_id  TEXT NOT NULL REFERENCES journal_entry(id),
+      target_type TEXT NOT NULL CHECK (target_type IN ('entity','statement','relationship','journal_entry')),
+      target_id   TEXT NOT NULL,
+      role        TEXT NOT NULL CHECK (role IN ('created','changed','proven','disproven','deleted')),
+      PRIMARY KEY (journal_id, target_type, target_id, role)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jlink_target ON journal_link(target_type, target_id);
+
+    CREATE TABLE IF NOT EXISTS embedding (
+      owner_type   TEXT NOT NULL CHECK (owner_type IN ('statement','journal_entry')),
+      owner_id     TEXT NOT NULL,
+      vec_rowid    INTEGER NOT NULL,
+      model_id     TEXT NOT NULL,
+      dim          INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      PRIMARY KEY (owner_type, owner_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_emb_vecrow ON embedding(vec_rowid);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(embedding float[384]);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_statements USING fts5(
+      statement_id UNINDEXED, claim, entity_title
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_journal USING fts5(
+      journal_id UNINDEXED, narrative, commands
+    );
+  `);
+}
+function migrateV2(db) {
+  db.exec(`
+    CREATE TEMP TABLE mig_vec AS
+      SELECT e.owner_type   AS owner_type,
+             e.owner_id     AS owner_id,
+             v.embedding    AS embedding,
+             COALESCE(s.project_id, j.project_id) AS project_id,
+             COALESCE(s.status, j.status)         AS status
+      FROM embedding e
+      JOIN vec_index v ON v.rowid = e.vec_rowid
+      LEFT JOIN statement s     ON e.owner_type = 'statement'     AND s.id = e.owner_id
+      LEFT JOIN journal_entry j ON e.owner_type = 'journal_entry' AND j.id = e.owner_id;
+
+    DROP TABLE vec_index;
+    CREATE VIRTUAL TABLE vec_index USING vec0(
+      project_id TEXT partition key,
+      embedding float[384],
+      owner_type TEXT,
+      status TEXT
+    );
+  `);
+  const vectors = db.prepare("SELECT owner_type, owner_id, embedding, project_id, status FROM mig_vec WHERE project_id IS NOT NULL").all();
+  const insertVec = db.prepare("INSERT INTO vec_index(project_id, embedding, owner_type, status) VALUES (?, ?, ?, ?)");
+  const remap = db.prepare("UPDATE embedding SET vec_rowid = ? WHERE owner_type = ? AND owner_id = ?");
+  for (const row of vectors) {
+    const inserted = insertVec.run(row.project_id, row.embedding, row.owner_type, row.status);
+    remap.run(Number(inserted.lastInsertRowid), row.owner_type, row.owner_id);
+  }
+  db.exec(`
+    DELETE FROM embedding WHERE NOT EXISTS (
+      SELECT 1 FROM mig_vec m
+      WHERE m.owner_type = embedding.owner_type AND m.owner_id = embedding.owner_id AND m.project_id IS NOT NULL
+    );
+    DROP TABLE mig_vec;
+
+    DROP TABLE fts_statements;
+    CREATE VIRTUAL TABLE fts_statements USING fts5(
+      statement_id UNINDEXED, claim, entity_title, project_id UNINDEXED, status UNINDEXED
+    );
+    INSERT INTO fts_statements(statement_id, claim, entity_title, project_id, status)
+      SELECT s.id, s.claim, e.title, s.project_id, s.status
+      FROM statement s JOIN entity e ON e.id = s.entity_id;
+
+    DROP TABLE fts_journal;
+    CREATE VIRTUAL TABLE fts_journal USING fts5(
+      journal_id UNINDEXED, narrative, commands, project_id UNINDEXED, status UNINDEXED
+    );
+    INSERT INTO fts_journal(journal_id, narrative, commands, project_id, status)
+      SELECT id, narrative, COALESCE(commands, ''), project_id, status
+      FROM journal_entry
+      WHERE narrative IS NOT NULL AND narrative != '';
+  `);
 }
 
 // src/domain/paths.ts
@@ -548,7 +605,10 @@ var memoryRecentShape = {
   where: z.enum(["knowledge-base", "journal", "both"]).default("both").describe("Scope: knowledge-base, journal, or both."),
   kind: z.enum(["entity", "statement", "journal"]).optional().describe("Restrict to one record kind."),
   limit: z.number().int().min(1).max(100).default(20).describe("Page size (1-100)."),
-  before: z.number().int().optional().describe("Unix epoch milliseconds cursor: return records created strictly before this, for paging."),
+  before: z.number().int().optional().describe("Paging cursor: pass the previous page\u2019s next_before (Unix epoch milliseconds)."),
+  before_id: z.string().optional().describe(
+    "Paging cursor tiebreaker: pass the previous page\u2019s next_before_id together with before so records sharing a timestamp are not skipped."
+  ),
   include_invalid: z.boolean().default(false).describe("Include retired/invalid records."),
   project: projectParam
 };
@@ -618,7 +678,7 @@ function createMcpServer(api, version = "0.1.0") {
   server.registerTool(
     "memory.recent",
     {
-      description: "Chronological latest-to-oldest view for situational awareness and paging. This is not relevance search; use memory.search for retrieval. Invalid records are excluded unless include_invalid is true.",
+      description: "Chronological latest-to-oldest view for situational awareness and paging. This is not relevance search; use memory.search for retrieval. Invalid records are excluded unless include_invalid is true. To page, pass the returned next_before and next_before_id back as before and before_id.",
       inputSchema: memoryRecentShape
     },
     (args) => wrap(() => api.recent(args))
@@ -650,7 +710,7 @@ function createMcpServer(api, version = "0.1.0") {
   server.registerTool(
     "kb.upsert_entity",
     {
-      description: "Create or update a KB entity: the named subject (a service, file, person, config, concept) that statements hang from. An entity carries no facts itself \u2014 keep the summary a short description and put every actual claim in a statement via kb.add_statement. Reuse an existing entity (search first) instead of creating duplicates; pass its id to update. Updates are allowed only while active; invalid entities are read-only. Title changes re-sync statement keyword titles but do not re-embed statements in v0.",
+      description: "Create or update a KB entity: the named subject (a service, file, person, config, concept) that statements hang from. An entity carries no facts itself \u2014 keep the summary a short description and put every actual claim in a statement via kb.add_statement. Reuse an existing entity (search first) instead of creating duplicates; pass its id to update. Updates are allowed only while active; invalid entities are read-only. Title changes re-key and re-embed the entity\u2019s statements so search stays consistent.",
       inputSchema: kbUpsertEntityShape
     },
     (args) => wrap(() => api.upsertEntity(args))
@@ -682,7 +742,7 @@ function createMcpServer(api, version = "0.1.0") {
   server.registerTool(
     "kb.delete",
     {
-      description: "Hard-delete a record permanently and run a full VACUUM so the content cannot be recovered from disk. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not (the journal is the audit log itself). Use this ONLY for poisoned content \u2014 secrets, credentials, PII, or garbage that must not persist. For ordinary stale or wrong knowledge use kb.invalidate instead, which keeps history. Give a reason that does not repeat the sensitive value.",
+      description: "Hard-delete a record permanently and run a full VACUUM so the content cannot be recovered from disk. Deleting an entity cascades to all of its statements and relationships. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not (the journal is the audit log itself). Use this ONLY for poisoned content \u2014 secrets, credentials, PII, or garbage that must not persist. For ordinary stale or wrong knowledge use kb.invalidate instead, which keeps history. Give a reason that does not repeat the sensitive value. If vacuum_completed is false in the result, the records are gone but the file vacuum was deferred because the database was busy.",
       inputSchema: kbDeleteShape
     },
     (args) => wrap(() => api.delete(args))
@@ -803,41 +863,49 @@ function sanitizeFtsQuery(query) {
   }
   return terms.map((term) => `"${term}"`).join(" OR ");
 }
-function upsertStatementFts(db, statementId, claim, entityTitle) {
+function upsertStatementFts(db, statementId, claim, entityTitle, projectId, status) {
   deleteStatementFts(db, statementId);
-  db.prepare("INSERT INTO fts_statements(statement_id, claim, entity_title) VALUES (?, ?, ?)").run(
-    statementId,
-    claim,
-    entityTitle
-  );
+  db.prepare(
+    "INSERT INTO fts_statements(statement_id, claim, entity_title, project_id, status) VALUES (?, ?, ?, ?, ?)"
+  ).run(statementId, claim, entityTitle, projectId, status);
+}
+function setStatementFtsStatus(db, statementId, status) {
+  db.prepare("UPDATE fts_statements SET status = ? WHERE statement_id = ?").run(status, statementId);
 }
 function deleteStatementFts(db, statementId) {
   db.prepare("DELETE FROM fts_statements WHERE statement_id = ?").run(statementId);
 }
-function upsertJournalFts(db, journalId, narrative, commands) {
+function upsertJournalFts(db, journalId, narrative, commands, projectId, status) {
   deleteJournalFts(db, journalId);
-  db.prepare("INSERT INTO fts_journal(journal_id, narrative, commands) VALUES (?, ?, ?)").run(
+  db.prepare("INSERT INTO fts_journal(journal_id, narrative, commands, project_id, status) VALUES (?, ?, ?, ?, ?)").run(
     journalId,
     narrative ?? "",
-    commands ? JSON.stringify(commands) : ""
+    commands ? JSON.stringify(commands) : "",
+    projectId,
+    status
   );
 }
 function deleteJournalFts(db, journalId) {
   db.prepare("DELETE FROM fts_journal WHERE journal_id = ?").run(journalId);
 }
-function ftsSearch(db, table, query, limit) {
+function ftsSearch(db, table, query, limit, projectId, includeInvalid) {
   const sanitized = sanitizeFtsQuery(query);
   if (!sanitized) {
     return [];
   }
+  const statusFilter = includeInvalid ? "" : "AND status = 'active'";
   if (table === "fts_statements") {
     return db.prepare(
-      "SELECT statement_id AS id, bm25(fts_statements) AS bm25 FROM fts_statements WHERE fts_statements MATCH ? ORDER BY bm25 LIMIT ?"
-    ).all(sanitized, limit);
+      `SELECT statement_id AS id, bm25(fts_statements) AS bm25 FROM fts_statements
+         WHERE fts_statements MATCH ? AND project_id = ? ${statusFilter}
+         ORDER BY bm25 LIMIT ?`
+    ).all(sanitized, projectId, limit);
   }
   return db.prepare(
-    "SELECT journal_id AS id, bm25(fts_journal) AS bm25 FROM fts_journal WHERE fts_journal MATCH ? ORDER BY bm25 LIMIT ?"
-  ).all(sanitized, limit);
+    `SELECT journal_id AS id, bm25(fts_journal) AS bm25 FROM fts_journal
+       WHERE fts_journal MATCH ? AND project_id = ? ${statusFilter}
+       ORDER BY bm25 LIMIT ?`
+  ).all(sanitized, projectId, limit);
 }
 
 // src/domain/json.ts
@@ -928,12 +996,12 @@ function snippet(text, length = 200) {
 function vectorJson(vec) {
   return JSON.stringify(Array.from(vec));
 }
-function upsertVector(db, ownerType, ownerId, vec, modelId, dim, contentHash) {
+function upsertVector(db, ownerType, ownerId, vec, modelId, dim, contentHash, projectId, status) {
   const existing = db.prepare("SELECT vec_rowid FROM embedding WHERE owner_type = ? AND owner_id = ?").get(ownerType, ownerId);
   if (existing) {
     db.prepare("DELETE FROM vec_index WHERE rowid = ?").run(existing.vec_rowid);
   }
-  const insert = db.prepare("INSERT INTO vec_index(embedding) VALUES (?)").run(vectorJson(vec));
+  const insert = db.prepare("INSERT INTO vec_index(project_id, embedding, owner_type, status) VALUES (?, ?, ?, ?)").run(projectId, vectorJson(vec), ownerType, status);
   const vecRowid = Number(insert.lastInsertRowid);
   db.prepare(
     `INSERT INTO embedding(owner_type, owner_id, vec_rowid, model_id, dim, content_hash)
@@ -945,6 +1013,12 @@ function upsertVector(db, ownerType, ownerId, vec, modelId, dim, contentHash) {
        content_hash = excluded.content_hash`
   ).run(ownerType, ownerId, vecRowid, modelId, dim, contentHash);
 }
+function setVectorStatus(db, ownerType, ownerId, status) {
+  const existing = db.prepare("SELECT vec_rowid FROM embedding WHERE owner_type = ? AND owner_id = ?").get(ownerType, ownerId);
+  if (existing) {
+    db.prepare("UPDATE vec_index SET status = ? WHERE rowid = ?").run(status, existing.vec_rowid);
+  }
+}
 function deleteVector(db, ownerType, ownerId) {
   const existing = db.prepare("SELECT vec_rowid FROM embedding WHERE owner_type = ? AND owner_id = ?").get(ownerType, ownerId);
   if (existing) {
@@ -952,14 +1026,15 @@ function deleteVector(db, ownerType, ownerId) {
     db.prepare("DELETE FROM embedding WHERE owner_type = ? AND owner_id = ?").run(ownerType, ownerId);
   }
 }
-function knn(db, queryVec, limit) {
+function knn(db, queryVec, limit, projectId, ownerType, includeInvalid) {
+  const statusFilter = includeInvalid ? "" : "AND v.status = 'active'";
   const rows = db.prepare(
-    `SELECT e.owner_type, e.owner_id, v.distance
+    `SELECT e.owner_id, v.distance
        FROM vec_index v
        JOIN embedding e ON e.vec_rowid = v.rowid
-       WHERE v.embedding MATCH ? AND v.k = ?
+       WHERE v.embedding MATCH ? AND v.k = ? AND v.project_id = ? AND v.owner_type = ? ${statusFilter}
        ORDER BY v.distance`
-  ).all(vectorJson(queryVec), limit);
+  ).all(vectorJson(queryVec), limit, projectId, ownerType);
   return rows;
 }
 
@@ -1001,7 +1076,7 @@ Use journal.append to record what you did, the commands you ran, and which state
 Statements are never edited in place. Use kb.edit_statement to create the replacement statement and invalidate the old one with a redirect, or use kb.invalidate when a statement should simply be retired. Invalid statements stay readable through memory.get and are searchable only when include_invalid is requested.
 
 6. Invalidate vs delete.
-Use kb.invalidate for stale, wrong, or superseded knowledge. Use kb.delete only for poisoned content such as leaked secrets, credentials, PII, or garbage that must not persist on disk. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not. Either way deletion runs a full VACUUM.
+Use kb.invalidate for stale, wrong, or superseded knowledge. Use kb.delete only for poisoned content such as leaked secrets, credentials, PII, or garbage that must not persist on disk. Deleting an entity also deletes all of its statements and relationships. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not. Either way deletion runs a full VACUUM.
 
 7. Secrets and PII.
 Do not store credentials, tokens, private keys, personal data, or copied sensitive output in statements or journals. If a command prints sensitive material, summarize only the safe lesson learned. If sensitive content is already stored, immediately use kb.delete with a reason that does not repeat the secret.
@@ -1230,12 +1305,12 @@ var MemoryApi = class {
     }
     throw new Error(`No record found for id ${args.id}`);
   }
-  upsertEntity(input) {
+  async upsertEntity(input) {
     const args = kbUpsertEntitySchema.parse(input);
     const project = this.project(args.project);
-    const result = this.runMutation(() => {
-      const timestamp = now();
-      if (!args.id) {
+    if (!args.id) {
+      return this.runMutation(() => {
+        const timestamp = now();
         const id = newId("entity");
         this.db.prepare(
           `INSERT INTO entity(id, project_id, type, title, summary, tags, created_at, last_updated_at, status)
@@ -1251,12 +1326,27 @@ var MemoryApi = class {
           timestamp
         );
         return entityOut(this.loadEntity(id, project.id));
-      }
-      const existing = this.loadEntity(args.id, project.id);
-      if (!existing) throw new Error(`No active entity found for id ${args.id}`);
-      if (existing.status !== "active") {
-        throw new Error(`Entity ${args.id} is invalid and read-only`);
-      }
+      });
+    }
+    const entityId = args.id;
+    const existing = this.loadEntity(entityId, project.id);
+    if (!existing) throw new Error(`No active entity found for id ${entityId}`);
+    if (existing.status !== "active") {
+      throw new Error(`Entity ${entityId} is invalid and read-only`);
+    }
+    const titleChanged = args.title !== existing.title;
+    const statements = titleChanged ? this.db.prepare("SELECT id, claim, status FROM statement WHERE entity_id = ? AND project_id = ?").all(entityId, project.id) : [];
+    const reindexed = [];
+    for (const statement of statements) {
+      const documentText = statementDocumentText(statement.claim, args.title);
+      reindexed.push({
+        ...statement,
+        vec: await this.embeddings.embedDocument(documentText),
+        hash: this.embeddings.contentHash(documentText)
+      });
+    }
+    return this.runMutation(() => {
+      const timestamp = now();
       this.db.prepare(
         `UPDATE entity
            SET type = ?, title = ?, summary = ?, tags = ?, last_updated_at = ?
@@ -1267,16 +1357,25 @@ var MemoryApi = class {
         args.summary ?? existing.summary,
         args.tags === void 0 ? existing.tags : JSON.stringify(args.tags),
         timestamp,
-        args.id,
+        entityId,
         project.id
       );
-      const statements = this.db.prepare("SELECT id, claim FROM statement WHERE entity_id = ? AND project_id = ?").all(args.id, project.id);
-      for (const statement of statements) {
-        upsertStatementFts(this.db, statement.id, statement.claim, args.title);
+      for (const statement of reindexed) {
+        upsertStatementFts(this.db, statement.id, statement.claim, args.title, project.id, statement.status);
+        upsertVector(
+          this.db,
+          "statement",
+          statement.id,
+          statement.vec,
+          this.embeddings.modelId(),
+          this.embeddings.dim(),
+          statement.hash,
+          project.id,
+          statement.status
+        );
       }
-      return entityOut(this.loadEntity(args.id, project.id));
+      return entityOut(this.loadEntity(entityId, project.id));
     });
-    return result;
   }
   async addStatement(input) {
     const args = kbAddStatementSchema.parse(input);
@@ -1300,7 +1399,7 @@ var MemoryApi = class {
         this.requireJournal(args.journal_entry_id, project.id);
       } else {
         this.insertJournal(stubJournalId, project.id, timestamp, null, null, null, stubNarrative, true);
-        upsertJournalFts(this.db, stubJournalId, stubNarrative, null);
+        upsertJournalFts(this.db, stubJournalId, stubNarrative, null, project.id, "active");
         upsertVector(
           this.db,
           "journal_entry",
@@ -1308,7 +1407,9 @@ var MemoryApi = class {
           stubVec,
           this.embeddings.modelId(),
           this.embeddings.dim(),
-          stubHash
+          stubHash,
+          project.id,
+          "active"
         );
       }
       this.insertStatement({
@@ -1331,9 +1432,11 @@ var MemoryApi = class {
         statementVec,
         this.embeddings.modelId(),
         this.embeddings.dim(),
-        statementHash
+        statementHash,
+        project.id,
+        "active"
       );
-      upsertStatementFts(this.db, statementId, args.claim, entity.title);
+      upsertStatementFts(this.db, statementId, args.claim, entity.title, project.id, "active");
       this.insertJournalLink(journalEntryId, "statement", statementId, "created");
       return {
         statement: statementOut(this.loadStatement(statementId, project.id)),
@@ -1391,7 +1494,7 @@ var MemoryApi = class {
         this.requireJournal(args.journal_entry_id, project.id);
       } else {
         this.insertJournal(stubJournalId, project.id, timestamp, null, null, null, stubNarrative, true);
-        upsertJournalFts(this.db, stubJournalId, stubNarrative, null);
+        upsertJournalFts(this.db, stubJournalId, stubNarrative, null, project.id, "active");
         upsertVector(
           this.db,
           "journal_entry",
@@ -1399,7 +1502,9 @@ var MemoryApi = class {
           stubVec,
           this.embeddings.modelId(),
           this.embeddings.dim(),
-          stubHash
+          stubHash,
+          project.id,
+          "active"
         );
       }
       this.insertStatement({
@@ -1422,9 +1527,11 @@ var MemoryApi = class {
         statementVec,
         this.embeddings.modelId(),
         this.embeddings.dim(),
-        statementHash
+        statementHash,
+        project.id,
+        "active"
       );
-      upsertStatementFts(this.db, newStatementId, replacement.claim, entity.title);
+      upsertStatementFts(this.db, newStatementId, replacement.claim, entity.title, project.id, "active");
       this.db.prepare(
         `UPDATE statement
            SET status = 'invalid', invalidated_at = ?, superseded_by = ?, invalidation_note = ?
@@ -1436,6 +1543,8 @@ var MemoryApi = class {
         target.id,
         project.id
       );
+      setStatementFtsStatus(this.db, target.id, "invalid");
+      setVectorStatus(this.db, "statement", target.id, "invalid");
       this.insertJournalLink(journalEntryId, "statement", newStatementId, "created");
       this.insertJournalLink(journalEntryId, "statement", newStatementId, "changed");
       return {
@@ -1478,14 +1587,23 @@ var MemoryApi = class {
            SET status = 'invalid', invalidated_at = ?, invalidation_note = ?, superseded_by = ?
            WHERE id = ? AND project_id = ?`
       ).run(invalidatedAt, args.note, args.superseded_by ?? null, args.id, project.id);
-      if (target.table === "statement") return statementOut(this.loadStatement(args.id, project.id));
+      if (target.table === "statement") {
+        setStatementFtsStatus(this.db, args.id, "invalid");
+        setVectorStatus(this.db, "statement", args.id, "invalid");
+        return statementOut(this.loadStatement(args.id, project.id));
+      }
       if (target.table === "entity") {
-        const cascade = this.db.prepare(
+        const cascadeIds = this.db.prepare("SELECT id FROM statement WHERE entity_id = ? AND project_id = ? AND status = 'active'").all(args.id, project.id).map((row2) => row2.id);
+        this.db.prepare(
           `UPDATE statement
              SET status = 'invalid', invalidated_at = ?, invalidation_note = ?
              WHERE entity_id = ? AND project_id = ? AND status = 'active'`
         ).run(invalidatedAt, `Parent entity ${args.id} retired: ${args.note}`, args.id, project.id);
-        return { ...entityOut(this.loadEntity(args.id, project.id)), cascaded_statements: cascade.changes };
+        for (const statementId of cascadeIds) {
+          setStatementFtsStatus(this.db, statementId, "invalid");
+          setVectorStatus(this.db, "statement", statementId, "invalid");
+        }
+        return { ...entityOut(this.loadEntity(args.id, project.id)), cascaded_statements: cascadeIds.length };
       }
       return relationshipOut(this.loadRelationship(args.id, project.id));
     });
@@ -1532,7 +1650,7 @@ var MemoryApi = class {
         this.insertJournalLink(journalId, "statement", statementId, "disproven");
       }
       if (shouldIndex) {
-        upsertJournalFts(this.db, journalId, narrative, args.commands ?? null);
+        upsertJournalFts(this.db, journalId, narrative, args.commands ?? null, project.id, "active");
         upsertVector(
           this.db,
           "journal_entry",
@@ -1540,7 +1658,9 @@ var MemoryApi = class {
           vec,
           this.embeddings.modelId(),
           this.embeddings.dim(),
-          hash
+          hash,
+          project.id,
+          "active"
         );
       }
       return journalOut(this.db, this.loadJournal(journalId, project.id));
@@ -1560,106 +1680,160 @@ var MemoryApi = class {
         if (!row) throw new Error(`No record found for id ${args.id}`);
         const isJournalTarget = target.table === "journal_entry";
         const timestamp = now();
+        const cascadeStatements = target.table === "entity" ? this.db.prepare("SELECT id FROM statement WHERE entity_id = ? AND project_id = ?").all(args.id, project.id).map((statement) => statement.id) : [];
+        const cascadeRelationships = target.table === "entity" ? this.db.prepare("SELECT id FROM relationship WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)").all(project.id, args.id, args.id).map((relationship) => relationship.id) : [];
         let journalId = null;
         if (!isJournalTarget) {
           journalId = newId("journal");
-          this.insertJournal(
-            journalId,
-            project.id,
-            timestamp,
-            null,
-            null,
-            null,
-            `DELETED ${target.targetType} ${args.id}: ${args.reason}`,
-            false
-          );
-          this.insertJournalLink(
-            journalId,
-            target.targetType,
-            args.id,
-            "deleted"
-          );
+          const cascadeSuffix = cascadeStatements.length > 0 || cascadeRelationships.length > 0 ? ` (cascaded ${cascadeStatements.length} statements, ${cascadeRelationships.length} relationships)` : "";
+          const narrative = `DELETED ${target.targetType} ${args.id}${cascadeSuffix}: ${args.reason}`;
+          this.insertJournal(journalId, project.id, timestamp, null, null, null, narrative, false);
+          upsertJournalFts(this.db, journalId, narrative, null, project.id, "active");
+          this.insertJournalLink(journalId, target.targetType, args.id, "deleted");
+          for (const statementId of cascadeStatements) {
+            this.insertJournalLink(journalId, "statement", statementId, "deleted");
+          }
+          for (const relationshipId of cascadeRelationships) {
+            this.insertJournalLink(journalId, "relationship", relationshipId, "deleted");
+          }
         }
         if (isJournalTarget) {
           this.db.prepare("UPDATE journal_entry SET superseded_by = NULL WHERE superseded_by = ? AND project_id = ?").run(args.id, project.id);
-        } else {
-          this.db.prepare(
-            `UPDATE ${target.table}
-               SET superseded_by = NULL,
-                   invalidation_note = COALESCE(invalidation_note, '') || ?
-               WHERE superseded_by = ? AND project_id = ?`
-          ).run(` [redirect target deleted ${args.id}]`, args.id, project.id);
-        }
-        if (isJournalTarget) {
           this.db.prepare("DELETE FROM journal_link WHERE (target_type = ? AND target_id = ?) OR journal_id = ?").run(target.targetType, args.id, args.id);
-        } else {
-          this.db.prepare(
-            "DELETE FROM journal_link WHERE target_type = ? AND target_id = ? AND NOT (journal_id = ? AND role = 'deleted')"
-          ).run(target.targetType, args.id, journalId);
+          deleteVector(this.db, "journal_entry", args.id);
+          deleteJournalFts(this.db, args.id);
+          this.db.prepare("DELETE FROM journal_entry WHERE id = ? AND project_id = ?").run(args.id, project.id);
+          return { deleted: args.id, target_type: target.targetType, journal_entry_id: null };
+        }
+        this.clearInboundRedirects(target.table, args.id, project.id);
+        this.dropNonAuditLinks(target.targetType, args.id, journalId);
+        for (const statementId of cascadeStatements) {
+          this.clearInboundRedirects("statement", statementId, project.id);
+          this.dropNonAuditLinks("statement", statementId, journalId);
+          deleteVector(this.db, "statement", statementId);
+          deleteStatementFts(this.db, statementId);
+        }
+        for (const relationshipId of cascadeRelationships) {
+          this.clearInboundRedirects("relationship", relationshipId, project.id);
+          this.dropNonAuditLinks("relationship", relationshipId, journalId);
         }
         if (target.vectorOwner) {
           deleteVector(this.db, target.vectorOwner, args.id);
         }
         if (target.table === "statement") {
           deleteStatementFts(this.db, args.id);
-        } else if (target.table === "journal_entry") {
-          deleteJournalFts(this.db, args.id);
+        }
+        if (target.table === "entity") {
+          this.db.prepare("DELETE FROM statement WHERE entity_id = ? AND project_id = ?").run(args.id, project.id);
+          this.db.prepare("DELETE FROM relationship WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)").run(project.id, args.id, args.id);
         }
         this.db.prepare(`DELETE FROM ${target.table} WHERE id = ? AND project_id = ?`).run(args.id, project.id);
-        return { deleted: args.id, target_type: target.targetType, journal_entry_id: journalId };
+        return {
+          deleted: args.id,
+          target_type: target.targetType,
+          journal_entry_id: journalId,
+          ...target.table === "entity" ? { cascaded_statements: cascadeStatements.length, cascaded_relationships: cascadeRelationships.length } : {}
+        };
       })()
     );
-    this.db.pragma("wal_checkpoint(TRUNCATE)");
-    this.db.exec("VACUUM");
-    return result;
+    let vacuumCompleted = true;
+    try {
+      withRetry(() => {
+        this.db.pragma("wal_checkpoint(TRUNCATE)");
+        this.db.exec("VACUUM");
+      });
+    } catch (err) {
+      vacuumCompleted = false;
+      console.error("agent-journal: post-delete vacuum failed:", err);
+    }
+    return {
+      ...result,
+      vacuum_completed: vacuumCompleted,
+      ...vacuumCompleted ? {} : {
+        nudge: "The records are deleted, but the database was busy so the file vacuum could not run; deleted content may remain in free pages until the next vacuum."
+      }
+    };
+  }
+  clearInboundRedirects(table, deletedId, projectId) {
+    this.db.prepare(
+      `UPDATE ${table}
+         SET superseded_by = NULL,
+             invalidation_note = COALESCE(invalidation_note, '') || ?
+         WHERE superseded_by = ? AND project_id = ?`
+    ).run(` [redirect target deleted ${deletedId}]`, deletedId, projectId);
+  }
+  dropNonAuditLinks(targetType, targetId, auditJournalId) {
+    this.db.prepare(
+      "DELETE FROM journal_link WHERE target_type = ? AND target_id = ? AND NOT (journal_id = ? AND role = 'deleted')"
+    ).run(targetType, targetId, auditJournalId);
   }
   recent(input) {
     const args = memoryRecentSchema.parse(input);
     const project = this.project(args.project);
     const includeKb = args.where === "knowledge-base" || args.where === "both";
     const includeJournal = args.where === "journal" || args.where === "both";
-    const rows = [];
+    const sources = [];
     if (includeKb && (!args.kind || args.kind === "entity")) {
-      rows.push(
-        ...this.db.prepare(
-          `SELECT 'entity' AS kind, id, created_at, title AS title_or_snippet
-             FROM entity
-             WHERE project_id = ? ${args.include_invalid ? "" : "AND status = 'active'"} ${args.before ? "AND created_at < ?" : ""}`
-        ).all(...args.before ? [project.id, args.before] : [project.id])
-      );
+      sources.push({ kind: "entity", table: "entity", snippetExpr: "title" });
     }
     if (includeKb && (!args.kind || args.kind === "statement")) {
-      rows.push(
-        ...this.db.prepare(
-          `SELECT 'statement' AS kind, id, created_at, claim AS title_or_snippet
-             FROM statement
-             WHERE project_id = ? ${args.include_invalid ? "" : "AND status = 'active'"} ${args.before ? "AND created_at < ?" : ""}`
-        ).all(...args.before ? [project.id, args.before] : [project.id])
-      );
+      sources.push({ kind: "statement", table: "statement", snippetExpr: "claim" });
     }
     if (includeJournal && (!args.kind || args.kind === "journal")) {
+      sources.push({ kind: "journal", table: "journal_entry", snippetExpr: "COALESCE(narrative, commands, '')" });
+    }
+    const statusSql = args.include_invalid ? "" : "AND status = 'active'";
+    let cursorSql = "";
+    let cursorParams = [];
+    if (args.before !== void 0 && args.before_id !== void 0) {
+      cursorSql = "AND (created_at < ? OR (created_at = ? AND id < ?))";
+      cursorParams = [args.before, args.before, args.before_id];
+    } else if (args.before !== void 0) {
+      cursorSql = "AND created_at < ?";
+      cursorParams = [args.before];
+    }
+    const rows = [];
+    for (const source of sources) {
       rows.push(
         ...this.db.prepare(
-          `SELECT 'journal' AS kind, id, created_at, COALESCE(narrative, commands, '') AS title_or_snippet
-             FROM journal_entry
-             WHERE project_id = ? ${args.include_invalid ? "" : "AND status = 'active'"} ${args.before ? "AND created_at < ?" : ""}`
-        ).all(...args.before ? [project.id, args.before] : [project.id])
+          `SELECT '${source.kind}' AS kind, id, created_at, ${source.snippetExpr} AS title_or_snippet
+             FROM ${source.table}
+             WHERE project_id = ? ${statusSql} ${cursorSql}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?`
+        ).all(project.id, ...cursorParams, args.limit)
       );
     }
     const reference = now();
-    const sorted = rows.map((row) => ({
+    const page = rows.map((row) => ({
       ...row,
       title_or_snippet: snippet(row.title_or_snippet),
       _relative: { created_at: humanizeRelative(row.created_at, reference) }
-    })).sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id));
-    const page = sorted.slice(0, args.limit);
+    })).sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0)).slice(0, args.limit);
     const last = page.at(-1);
-    const totalRemaining = last ? sorted.filter((row) => row.created_at < last.created_at).length : 0;
-    const oldest = sorted.length ? Math.min(...sorted.map((row) => row.created_at)) : null;
+    let totalRemaining = 0;
+    let oldest = null;
+    for (const source of sources) {
+      if (last) {
+        totalRemaining += this.db.prepare(
+          `SELECT COUNT(*) AS count FROM ${source.table}
+               WHERE project_id = ? ${statusSql} AND (created_at < ? OR (created_at = ? AND id < ?))`
+        ).get(project.id, last.created_at, last.created_at, last.id).count;
+      }
+      const min = this.db.prepare(
+        `SELECT MIN(created_at) AS min FROM ${source.table}
+             WHERE project_id = ? ${statusSql} ${cursorSql}`
+      ).get(project.id, ...cursorParams).min;
+      if (min !== null && (oldest === null || min < oldest)) {
+        oldest = min;
+      }
+    }
     const nextBefore = totalRemaining > 0 && last ? last.created_at : null;
+    const nextBeforeId = totalRemaining > 0 && last ? last.id : null;
     return {
       items: page,
       next_before: nextBefore,
+      next_before_id: nextBeforeId,
       total_remaining: totalRemaining,
       oldest_record_date: oldest,
       _relative: relativeMap(
@@ -1710,8 +1884,17 @@ var MemoryApi = class {
     return { snippet: AGENTS_MD_SNIPPET };
   }
   searchStatements(query, queryVec, project, config, timestamp, filters) {
-    const ftsIds = ftsSearch(this.db, "fts_statements", query, config.k_recall_fts).map((row) => row.id);
-    const vecIds = knn(this.db, queryVec, config.k_recall_vec).filter((row) => row.owner_type === "statement").map((row) => row.owner_id);
+    const ftsIds = ftsSearch(
+      this.db,
+      "fts_statements",
+      query,
+      config.k_recall_fts,
+      project.id,
+      filters.includeInvalid
+    ).map((row) => row.id);
+    const vecIds = knn(this.db, queryVec, config.k_recall_vec, project.id, "statement", filters.includeInvalid).map(
+      (row) => row.owner_id
+    );
     const ids = unique([...ftsIds, ...vecIds]);
     if (ids.length === 0) return [];
     const rows = this.db.prepare(
@@ -1747,8 +1930,17 @@ var MemoryApi = class {
     });
   }
   searchJournal(query, queryVec, project, config, timestamp, filters) {
-    const ftsIds = ftsSearch(this.db, "fts_journal", query, config.k_recall_fts).map((row) => row.id);
-    const vecIds = knn(this.db, queryVec, config.k_recall_vec).filter((row) => row.owner_type === "journal_entry").map((row) => row.owner_id);
+    const ftsIds = ftsSearch(
+      this.db,
+      "fts_journal",
+      query,
+      config.k_recall_fts,
+      project.id,
+      filters.includeInvalid
+    ).map((row) => row.id);
+    const vecIds = knn(this.db, queryVec, config.k_recall_vec, project.id, "journal_entry", filters.includeInvalid).map(
+      (row) => row.owner_id
+    );
     const ids = unique([...ftsIds, ...vecIds]);
     if (ids.length === 0) return [];
     const rows = this.db.prepare(`SELECT * FROM journal_entry WHERE id IN (${placeholders(ids)})`).all(...ids);

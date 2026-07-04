@@ -181,7 +181,13 @@ export const memoryRecentShape = {
     .number()
     .int()
     .optional()
-    .describe('Unix epoch milliseconds cursor: return records created strictly before this, for paging.'),
+    .describe('Paging cursor: pass the previous page’s next_before (Unix epoch milliseconds).'),
+  before_id: z
+    .string()
+    .optional()
+    .describe(
+      'Paging cursor tiebreaker: pass the previous page’s next_before_id together with before so records sharing a timestamp are not skipped.',
+    ),
   include_invalid: z.boolean().default(false).describe('Include retired/invalid records.'),
   project: projectParam,
 };

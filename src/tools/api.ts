@@ -4,6 +4,7 @@ import { resolveConfig, type MemoryConfig } from '../config.js';
 import type { Embeddings } from '../domain/embeddings.js';
 import {
   ftsSearch,
+  setStatementFtsStatus,
   upsertJournalFts,
   upsertStatementFts,
   deleteJournalFts,
@@ -14,7 +15,7 @@ import { idKind, newId, type IdKind } from '../domain/ids.js';
 import type { ProjectContext, ProjectResolver } from '../domain/project.js';
 import { entityOut, journalOut, snippet, statementOut } from '../domain/records.js';
 import { humanizeRelative, parseDurationMs, now, relativeMap } from '../domain/time.js';
-import { deleteVector, knn, upsertVector, type VectorOwnerType } from '../domain/vec.js';
+import { deleteVector, knn, setVectorStatus, upsertVector, type VectorOwnerType } from '../domain/vec.js';
 import { maybeVacuum } from '../domain/vacuum.js';
 import { AGENTS_MD_SNIPPET } from '../text/snippet.js';
 import { GUIDE } from '../text/guide.js';
@@ -375,13 +376,13 @@ export class MemoryApi {
     throw new Error(`No record found for id ${args.id}`);
   }
 
-  upsertEntity(input: unknown) {
+  async upsertEntity(input: unknown) {
     const args = kbUpsertEntitySchema.parse(input);
     const project = this.project(args.project);
 
-    const result = this.runMutation(() => {
-      const timestamp = now();
-      if (!args.id) {
+    if (!args.id) {
+      return this.runMutation(() => {
+        const timestamp = now();
         const id = newId('entity');
         this.db
           .prepare(
@@ -399,14 +400,42 @@ export class MemoryApi {
             timestamp,
           );
         return entityOut(this.loadEntity(id, project.id)!);
-      }
+      });
+    }
 
-      const existing = this.loadEntity(args.id, project.id);
-      if (!existing) throw new Error(`No active entity found for id ${args.id}`);
-      if (existing.status !== 'active') {
-        throw new Error(`Entity ${args.id} is invalid and read-only`);
-      }
+    const entityId = args.id;
+    const existing = this.loadEntity(entityId, project.id);
+    if (!existing) throw new Error(`No active entity found for id ${entityId}`);
+    if (existing.status !== 'active') {
+      throw new Error(`Entity ${entityId} is invalid and read-only`);
+    }
 
+    // Statement search entries embed the entity title alongside the claim, so
+    // a title change must re-key and re-embed every statement of the entity.
+    const titleChanged = args.title !== existing.title;
+    const statements = titleChanged
+      ? (this.db
+          .prepare('SELECT id, claim, status FROM statement WHERE entity_id = ? AND project_id = ?')
+          .all(entityId, project.id) as Array<{ id: string; claim: string; status: 'active' | 'invalid' }>)
+      : [];
+    const reindexed: Array<{
+      id: string;
+      claim: string;
+      status: 'active' | 'invalid';
+      vec: Float32Array;
+      hash: string;
+    }> = [];
+    for (const statement of statements) {
+      const documentText = statementDocumentText(statement.claim, args.title);
+      reindexed.push({
+        ...statement,
+        vec: await this.embeddings.embedDocument(documentText),
+        hash: this.embeddings.contentHash(documentText),
+      });
+    }
+
+    return this.runMutation(() => {
+      const timestamp = now();
       this.db
         .prepare(
           `UPDATE entity
@@ -419,21 +448,27 @@ export class MemoryApi {
           args.summary ?? existing.summary,
           args.tags === undefined ? existing.tags : JSON.stringify(args.tags),
           timestamp,
-          args.id,
+          entityId,
           project.id,
         );
 
-      const statements = this.db
-        .prepare('SELECT id, claim FROM statement WHERE entity_id = ? AND project_id = ?')
-        .all(args.id, project.id) as Array<{ id: string; claim: string }>;
-      for (const statement of statements) {
-        upsertStatementFts(this.db, statement.id, statement.claim, args.title);
+      for (const statement of reindexed) {
+        upsertStatementFts(this.db, statement.id, statement.claim, args.title, project.id, statement.status);
+        upsertVector(
+          this.db,
+          'statement',
+          statement.id,
+          statement.vec,
+          this.embeddings.modelId(),
+          this.embeddings.dim(),
+          statement.hash,
+          project.id,
+          statement.status,
+        );
       }
 
-      return entityOut(this.loadEntity(args.id, project.id)!);
+      return entityOut(this.loadEntity(entityId, project.id)!);
     });
-
-    return result;
   }
 
   async addStatement(input: unknown) {
@@ -461,7 +496,7 @@ export class MemoryApi {
         this.requireJournal(args.journal_entry_id, project.id);
       } else {
         this.insertJournal(stubJournalId!, project.id, timestamp, null, null, null, stubNarrative, true);
-        upsertJournalFts(this.db, stubJournalId!, stubNarrative, null);
+        upsertJournalFts(this.db, stubJournalId!, stubNarrative, null, project.id, 'active');
         upsertVector(
           this.db,
           'journal_entry',
@@ -470,6 +505,8 @@ export class MemoryApi {
           this.embeddings.modelId(),
           this.embeddings.dim(),
           stubHash!,
+          project.id,
+          'active',
         );
       }
 
@@ -494,8 +531,10 @@ export class MemoryApi {
         this.embeddings.modelId(),
         this.embeddings.dim(),
         statementHash,
+        project.id,
+        'active',
       );
-      upsertStatementFts(this.db, statementId, args.claim, entity.title);
+      upsertStatementFts(this.db, statementId, args.claim, entity.title, project.id, 'active');
       this.insertJournalLink(journalEntryId, 'statement', statementId, 'created');
 
       return {
@@ -567,7 +606,7 @@ export class MemoryApi {
         this.requireJournal(args.journal_entry_id, project.id);
       } else {
         this.insertJournal(stubJournalId!, project.id, timestamp, null, null, null, stubNarrative, true);
-        upsertJournalFts(this.db, stubJournalId!, stubNarrative, null);
+        upsertJournalFts(this.db, stubJournalId!, stubNarrative, null, project.id, 'active');
         upsertVector(
           this.db,
           'journal_entry',
@@ -576,6 +615,8 @@ export class MemoryApi {
           this.embeddings.modelId(),
           this.embeddings.dim(),
           stubHash!,
+          project.id,
+          'active',
         );
       }
 
@@ -600,8 +641,10 @@ export class MemoryApi {
         this.embeddings.modelId(),
         this.embeddings.dim(),
         statementHash,
+        project.id,
+        'active',
       );
-      upsertStatementFts(this.db, newStatementId, replacement.claim, entity.title);
+      upsertStatementFts(this.db, newStatementId, replacement.claim, entity.title, project.id, 'active');
 
       this.db
         .prepare(
@@ -616,6 +659,8 @@ export class MemoryApi {
           target.id,
           project.id,
         );
+      setStatementFtsStatus(this.db, target.id, 'invalid');
+      setVectorStatus(this.db, 'statement', target.id, 'invalid');
 
       this.insertJournalLink(journalEntryId, 'statement', newStatementId, 'created');
       this.insertJournalLink(journalEntryId, 'statement', newStatementId, 'changed');
@@ -669,20 +714,33 @@ export class MemoryApi {
         )
         .run(invalidatedAt, args.note, args.superseded_by ?? null, args.id, project.id);
 
-      if (target.table === 'statement') return statementOut(this.loadStatement(args.id, project.id)!);
+      if (target.table === 'statement') {
+        setStatementFtsStatus(this.db, args.id, 'invalid');
+        setVectorStatus(this.db, 'statement', args.id, 'invalid');
+        return statementOut(this.loadStatement(args.id, project.id)!);
+      }
       if (target.table === 'entity') {
         // Cascade to the entity's own active statements so a retired entity
         // never leaves live claims dangling behind it. superseded_by is left
         // null on the children — the entity's redirect is entity-typed and
         // cannot stand in for a statement.
-        const cascade = this.db
+        const cascadeIds = (
+          this.db
+            .prepare("SELECT id FROM statement WHERE entity_id = ? AND project_id = ? AND status = 'active'")
+            .all(args.id, project.id) as Array<{ id: string }>
+        ).map((row) => row.id);
+        this.db
           .prepare(
             `UPDATE statement
              SET status = 'invalid', invalidated_at = ?, invalidation_note = ?
              WHERE entity_id = ? AND project_id = ? AND status = 'active'`,
           )
           .run(invalidatedAt, `Parent entity ${args.id} retired: ${args.note}`, args.id, project.id);
-        return { ...entityOut(this.loadEntity(args.id, project.id)!), cascaded_statements: cascade.changes };
+        for (const statementId of cascadeIds) {
+          setStatementFtsStatus(this.db, statementId, 'invalid');
+          setVectorStatus(this.db, 'statement', statementId, 'invalid');
+        }
+        return { ...entityOut(this.loadEntity(args.id, project.id)!), cascaded_statements: cascadeIds.length };
       }
       return relationshipOut(this.loadRelationship(args.id, project.id)!);
     });
@@ -741,7 +799,7 @@ export class MemoryApi {
       }
 
       if (shouldIndex) {
-        upsertJournalFts(this.db, journalId, narrative, args.commands ?? null);
+        upsertJournalFts(this.db, journalId, narrative, args.commands ?? null, project.id, 'active');
         upsertVector(
           this.db,
           'journal_entry',
@@ -750,6 +808,8 @@ export class MemoryApi {
           this.embeddings.modelId(),
           this.embeddings.dim(),
           hash!,
+          project.id,
+          'active',
         );
       }
 
@@ -774,56 +834,74 @@ export class MemoryApi {
         const isJournalTarget = target.table === 'journal_entry';
         const timestamp = now();
 
+        // Entity deletion cascades to the statements and relationships hanging
+        // off it — they carry the entity's content and would otherwise block
+        // the delete via foreign keys.
+        const cascadeStatements =
+          target.table === 'entity'
+            ? (
+                this.db
+                  .prepare('SELECT id FROM statement WHERE entity_id = ? AND project_id = ?')
+                  .all(args.id, project.id) as Array<{ id: string }>
+              ).map((statement) => statement.id)
+            : [];
+        const cascadeRelationships =
+          target.table === 'entity'
+            ? (
+                this.db
+                  .prepare('SELECT id FROM relationship WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)')
+                  .all(project.id, args.id, args.id) as Array<{ id: string }>
+              ).map((relationship) => relationship.id)
+            : [];
+
         // Deleting a journal entry must not spawn a fresh journal entry — the journal is
         // the audit log itself, so an audit record only makes sense for KB deletions.
         let journalId: string | null = null;
         if (!isJournalTarget) {
           journalId = newId('journal');
-          this.insertJournal(
-            journalId,
-            project.id,
-            timestamp,
-            null,
-            null,
-            null,
-            `DELETED ${target.targetType} ${args.id}: ${args.reason}`,
-            false,
-          );
-          this.insertJournalLink(
-            journalId,
-            target.targetType as 'entity' | 'statement' | 'relationship' | 'journal_entry',
-            args.id,
-            'deleted',
-          );
+          const cascadeSuffix =
+            cascadeStatements.length > 0 || cascadeRelationships.length > 0
+              ? ` (cascaded ${cascadeStatements.length} statements, ${cascadeRelationships.length} relationships)`
+              : '';
+          const narrative = `DELETED ${target.targetType} ${args.id}${cascadeSuffix}: ${args.reason}`;
+          this.insertJournal(journalId, project.id, timestamp, null, null, null, narrative, false);
+          upsertJournalFts(this.db, journalId, narrative, null, project.id, 'active');
+          this.insertJournalLink(journalId, target.targetType, args.id, 'deleted');
+          for (const statementId of cascadeStatements) {
+            this.insertJournalLink(journalId, 'statement', statementId, 'deleted');
+          }
+          for (const relationshipId of cascadeRelationships) {
+            this.insertJournalLink(journalId, 'relationship', relationshipId, 'deleted');
+          }
         }
 
         if (isJournalTarget) {
           this.db
             .prepare('UPDATE journal_entry SET superseded_by = NULL WHERE superseded_by = ? AND project_id = ?')
             .run(args.id, project.id);
-        } else {
-          this.db
-            .prepare(
-              `UPDATE ${target.table}
-               SET superseded_by = NULL,
-                   invalidation_note = COALESCE(invalidation_note, '') || ?
-               WHERE superseded_by = ? AND project_id = ?`,
-            )
-            .run(` [redirect target deleted ${args.id}]`, args.id, project.id);
-        }
-
-        if (isJournalTarget) {
           // Drop both inbound links (other journals pointing here) and this journal's own
           // outbound links so the foreign-key delete below succeeds.
           this.db
             .prepare('DELETE FROM journal_link WHERE (target_type = ? AND target_id = ?) OR journal_id = ?')
             .run(target.targetType, args.id, args.id);
-        } else {
-          this.db
-            .prepare(
-              "DELETE FROM journal_link WHERE target_type = ? AND target_id = ? AND NOT (journal_id = ? AND role = 'deleted')",
-            )
-            .run(target.targetType, args.id, journalId);
+          deleteVector(this.db, 'journal_entry', args.id);
+          deleteJournalFts(this.db, args.id);
+          this.db.prepare('DELETE FROM journal_entry WHERE id = ? AND project_id = ?').run(args.id, project.id);
+          return { deleted: args.id, target_type: target.targetType, journal_entry_id: null };
+        }
+
+        this.clearInboundRedirects(target.table, args.id, project.id);
+        this.dropNonAuditLinks(target.targetType, args.id, journalId!);
+
+        for (const statementId of cascadeStatements) {
+          this.clearInboundRedirects('statement', statementId, project.id);
+          this.dropNonAuditLinks('statement', statementId, journalId!);
+          deleteVector(this.db, 'statement', statementId);
+          deleteStatementFts(this.db, statementId);
+        }
+        for (const relationshipId of cascadeRelationships) {
+          this.clearInboundRedirects('relationship', relationshipId, project.id);
+          this.dropNonAuditLinks('relationship', relationshipId, journalId!);
         }
 
         if (target.vectorOwner) {
@@ -831,19 +909,73 @@ export class MemoryApi {
         }
         if (target.table === 'statement') {
           deleteStatementFts(this.db, args.id);
-        } else if (target.table === 'journal_entry') {
-          deleteJournalFts(this.db, args.id);
         }
 
+        if (target.table === 'entity') {
+          this.db.prepare('DELETE FROM statement WHERE entity_id = ? AND project_id = ?').run(args.id, project.id);
+          this.db
+            .prepare('DELETE FROM relationship WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)')
+            .run(project.id, args.id, args.id);
+        }
         this.db.prepare(`DELETE FROM ${target.table} WHERE id = ? AND project_id = ?`).run(args.id, project.id);
 
-        return { deleted: args.id, target_type: target.targetType, journal_entry_id: journalId };
+        return {
+          deleted: args.id,
+          target_type: target.targetType,
+          journal_entry_id: journalId,
+          ...(target.table === 'entity'
+            ? { cascaded_statements: cascadeStatements.length, cascaded_relationships: cascadeRelationships.length }
+            : {}),
+        };
       })(),
     );
 
-    this.db.pragma('wal_checkpoint(TRUNCATE)');
-    this.db.exec('VACUUM');
-    return result;
+    // The delete is committed at this point; a busy checkpoint or vacuum must
+    // not be reported back as a failed deletion.
+    let vacuumCompleted = true;
+    try {
+      withRetry(() => {
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+        this.db.exec('VACUUM');
+      });
+    } catch (err) {
+      vacuumCompleted = false;
+      console.error('agent-journal: post-delete vacuum failed:', err);
+    }
+
+    return {
+      ...result,
+      vacuum_completed: vacuumCompleted,
+      ...(vacuumCompleted
+        ? {}
+        : {
+            nudge:
+              'The records are deleted, but the database was busy so the file vacuum could not run; deleted content may remain in free pages until the next vacuum.',
+          }),
+    };
+  }
+
+  private clearInboundRedirects(table: string, deletedId: string, projectId: string): void {
+    this.db
+      .prepare(
+        `UPDATE ${table}
+         SET superseded_by = NULL,
+             invalidation_note = COALESCE(invalidation_note, '') || ?
+         WHERE superseded_by = ? AND project_id = ?`,
+      )
+      .run(` [redirect target deleted ${deletedId}]`, deletedId, projectId);
+  }
+
+  private dropNonAuditLinks(
+    targetType: 'entity' | 'statement' | 'relationship' | 'journal_entry',
+    targetId: string,
+    auditJournalId: string,
+  ): void {
+    this.db
+      .prepare(
+        "DELETE FROM journal_link WHERE target_type = ? AND target_id = ? AND NOT (journal_id = ? AND role = 'deleted')",
+      )
+      .run(targetType, targetId, auditJournalId);
   }
 
   recent(input: unknown) {
@@ -851,72 +983,100 @@ export class MemoryApi {
     const project = this.project(args.project);
     const includeKb = args.where === 'knowledge-base' || args.where === 'both';
     const includeJournal = args.where === 'journal' || args.where === 'both';
+
+    const sources: Array<{ kind: 'entity' | 'statement' | 'journal'; table: string; snippetExpr: string }> = [];
+    if (includeKb && (!args.kind || args.kind === 'entity')) {
+      sources.push({ kind: 'entity', table: 'entity', snippetExpr: 'title' });
+    }
+    if (includeKb && (!args.kind || args.kind === 'statement')) {
+      sources.push({ kind: 'statement', table: 'statement', snippetExpr: 'claim' });
+    }
+    if (includeJournal && (!args.kind || args.kind === 'journal')) {
+      sources.push({ kind: 'journal', table: 'journal_entry', snippetExpr: "COALESCE(narrative, commands, '')" });
+    }
+
+    // Pages sort on (created_at DESC, id DESC), so the cursor must compare the
+    // same compound key — a bare timestamp cursor would skip records sharing
+    // the boundary record's created_at (statements and their auto-stub
+    // journals are created in the same millisecond as a matter of course).
+    const statusSql = args.include_invalid ? '' : "AND status = 'active'";
+    let cursorSql = '';
+    let cursorParams: Array<number | string> = [];
+    if (args.before !== undefined && args.before_id !== undefined) {
+      cursorSql = 'AND (created_at < ? OR (created_at = ? AND id < ?))';
+      cursorParams = [args.before, args.before, args.before_id];
+    } else if (args.before !== undefined) {
+      cursorSql = 'AND created_at < ?';
+      cursorParams = [args.before];
+    }
+
     const rows: Array<{
       kind: 'entity' | 'statement' | 'journal';
       id: string;
       created_at: number;
       title_or_snippet: string;
     }> = [];
-
-    if (includeKb && (!args.kind || args.kind === 'entity')) {
+    for (const source of sources) {
       rows.push(
         ...(this.db
           .prepare(
-            `SELECT 'entity' AS kind, id, created_at, title AS title_or_snippet
-             FROM entity
-             WHERE project_id = ? ${args.include_invalid ? '' : "AND status = 'active'"} ${
-               args.before ? 'AND created_at < ?' : ''
-}`,
+            `SELECT '${source.kind}' AS kind, id, created_at, ${source.snippetExpr} AS title_or_snippet
+             FROM ${source.table}
+             WHERE project_id = ? ${statusSql} ${cursorSql}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?`,
           )
-          .all(...(args.before ? [project.id, args.before] : [project.id])) as typeof rows),
-      );
-    }
-
-    if (includeKb && (!args.kind || args.kind === 'statement')) {
-      rows.push(
-        ...(this.db
-          .prepare(
-            `SELECT 'statement' AS kind, id, created_at, claim AS title_or_snippet
-             FROM statement
-             WHERE project_id = ? ${args.include_invalid ? '' : "AND status = 'active'"} ${
-               args.before ? 'AND created_at < ?' : ''
-}`,
-          )
-          .all(...(args.before ? [project.id, args.before] : [project.id])) as typeof rows),
-      );
-    }
-
-    if (includeJournal && (!args.kind || args.kind === 'journal')) {
-      rows.push(
-        ...(this.db
-          .prepare(
-            `SELECT 'journal' AS kind, id, created_at, COALESCE(narrative, commands, '') AS title_or_snippet
-             FROM journal_entry
-             WHERE project_id = ? ${args.include_invalid ? '' : "AND status = 'active'"} ${
-               args.before ? 'AND created_at < ?' : ''
-}`,
-          )
-          .all(...(args.before ? [project.id, args.before] : [project.id])) as typeof rows),
+          .all(project.id, ...cursorParams, args.limit) as typeof rows),
       );
     }
 
     const reference = now();
-    const sorted = rows
+    // The id tiebreak must be a binary comparison: the SQL cursor and ORDER BY
+    // compare ids with SQLite's BINARY collation, and a locale-aware sort here
+    // could disagree with it at a page boundary and skip or repeat records.
+    const page = rows
       .map((row) => ({
         ...row,
         title_or_snippet: snippet(row.title_or_snippet),
         _relative: { created_at: humanizeRelative(row.created_at, reference) },
       }))
-      .sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id));
-    const page = sorted.slice(0, args.limit);
+      .sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+      .slice(0, args.limit);
     const last = page.at(-1);
-    const totalRemaining = last ? sorted.filter((row) => row.created_at < last.created_at).length : 0;
-    const oldest = sorted.length ? Math.min(...sorted.map((row) => row.created_at)) : null;
+
+    let totalRemaining = 0;
+    let oldest: number | null = null;
+    for (const source of sources) {
+      if (last) {
+        totalRemaining += (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM ${source.table}
+               WHERE project_id = ? ${statusSql} AND (created_at < ? OR (created_at = ? AND id < ?))`,
+            )
+            .get(project.id, last.created_at, last.created_at, last.id) as { count: number }
+        ).count;
+      }
+      const min = (
+        this.db
+          .prepare(
+            `SELECT MIN(created_at) AS min FROM ${source.table}
+             WHERE project_id = ? ${statusSql} ${cursorSql}`,
+          )
+          .get(project.id, ...cursorParams) as { min: number | null }
+      ).min;
+      if (min !== null && (oldest === null || min < oldest)) {
+        oldest = min;
+      }
+    }
+
     const nextBefore = totalRemaining > 0 && last ? last.created_at : null;
+    const nextBeforeId = totalRemaining > 0 && last ? last.id : null;
 
     return {
       items: page,
       next_before: nextBefore,
+      next_before_id: nextBeforeId,
       total_remaining: totalRemaining,
       oldest_record_date: oldest,
       _relative: relativeMap(
@@ -991,10 +1151,17 @@ export class MemoryApi {
       includeDeletedSince?: string;
     },
   ): Candidate[] {
-    const ftsIds = ftsSearch(this.db, 'fts_statements', query, config.k_recall_fts).map((row) => row.id);
-    const vecIds = knn(this.db, queryVec, config.k_recall_vec)
-      .filter((row) => row.owner_type === 'statement')
-      .map((row) => row.owner_id);
+    const ftsIds = ftsSearch(
+      this.db,
+      'fts_statements',
+      query,
+      config.k_recall_fts,
+      project.id,
+      filters.includeInvalid,
+    ).map((row) => row.id);
+    const vecIds = knn(this.db, queryVec, config.k_recall_vec, project.id, 'statement', filters.includeInvalid).map(
+      (row) => row.owner_id,
+    );
     const ids = unique([...ftsIds, ...vecIds]);
     if (ids.length === 0) return [];
 
@@ -1052,10 +1219,17 @@ export class MemoryApi {
       includeDeletedSince?: string;
     },
   ): Candidate[] {
-    const ftsIds = ftsSearch(this.db, 'fts_journal', query, config.k_recall_fts).map((row) => row.id);
-    const vecIds = knn(this.db, queryVec, config.k_recall_vec)
-      .filter((row) => row.owner_type === 'journal_entry')
-      .map((row) => row.owner_id);
+    const ftsIds = ftsSearch(
+      this.db,
+      'fts_journal',
+      query,
+      config.k_recall_fts,
+      project.id,
+      filters.includeInvalid,
+    ).map((row) => row.id);
+    const vecIds = knn(this.db, queryVec, config.k_recall_vec, project.id, 'journal_entry', filters.includeInvalid).map(
+      (row) => row.owner_id,
+    );
     const ids = unique([...ftsIds, ...vecIds]);
     if (ids.length === 0) return [];
 

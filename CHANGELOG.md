@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `kb.delete` on an entity no longer fails with a foreign-key error: it now
+  cascades to the entity's statements and relationships, cleaning their search
+  index entries, journal links, and inbound redirects, and records the cascade
+  in the audit journal entry.
+- `memory.recent` no longer silently drops records that share a `created_at`
+  with a page boundary. Paging now uses a compound cursor: pass the returned
+  `next_before` and `next_before_id` back as `before` and `before_id`.
+- A busy checkpoint or vacuum after `kb.delete` is no longer reported as a
+  failed deletion; the result now carries `vacuum_completed` instead.
+
+### Changed
+
+- Schema v2: search indexes are project-scoped. The vector index is
+  partitioned by project with owner type and status metadata, and the FTS
+  tables carry project/status columns, so search recall budgets apply per
+  project and per store instead of to one global pool, and invalidated
+  tombstones stop consuming recall slots unless `include_invalid` is set.
+  Existing databases migrate automatically; vectors are copied without
+  re-embedding.
+- `kb.upsert_entity` title changes now re-embed the entity's statements so
+  semantic search reflects the new title (previously only keyword search was
+  re-synced).
+- `memory.recent` pages via SQL ordering and aggregates instead of loading
+  whole tables into memory.
+- Deletion audit journal entries are now keyword-searchable.
+
 ## [0.1.0] - 2026-06-25
 
 ### Added

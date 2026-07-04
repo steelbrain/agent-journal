@@ -73,7 +73,7 @@ export function createMcpServer(api: MemoryApi, version = '0.1.0'): McpServer {
     'memory.recent',
     {
       description:
-        'Chronological latest-to-oldest view for situational awareness and paging. This is not relevance search; use memory.search for retrieval. Invalid records are excluded unless include_invalid is true.',
+        'Chronological latest-to-oldest view for situational awareness and paging. This is not relevance search; use memory.search for retrieval. Invalid records are excluded unless include_invalid is true. To page, pass the returned next_before and next_before_id back as before and before_id.',
       inputSchema: memoryRecentShape,
     },
     (args) => wrap(() => api.recent(args)),
@@ -113,7 +113,7 @@ export function createMcpServer(api: MemoryApi, version = '0.1.0'): McpServer {
     'kb.upsert_entity',
     {
       description:
-        'Create or update a KB entity: the named subject (a service, file, person, config, concept) that statements hang from. An entity carries no facts itself — keep the summary a short description and put every actual claim in a statement via kb.add_statement. Reuse an existing entity (search first) instead of creating duplicates; pass its id to update. Updates are allowed only while active; invalid entities are read-only. Title changes re-sync statement keyword titles but do not re-embed statements in v0.',
+        'Create or update a KB entity: the named subject (a service, file, person, config, concept) that statements hang from. An entity carries no facts itself — keep the summary a short description and put every actual claim in a statement via kb.add_statement. Reuse an existing entity (search first) instead of creating duplicates; pass its id to update. Updates are allowed only while active; invalid entities are read-only. Title changes re-key and re-embed the entity’s statements so search stays consistent.',
       inputSchema: kbUpsertEntityShape,
     },
     (args) => wrap(() => api.upsertEntity(args)),
@@ -153,7 +153,7 @@ export function createMcpServer(api: MemoryApi, version = '0.1.0'): McpServer {
     'kb.delete',
     {
       description:
-        'Hard-delete a record permanently and run a full VACUUM so the content cannot be recovered from disk. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not (the journal is the audit log itself). Use this ONLY for poisoned content — secrets, credentials, PII, or garbage that must not persist. For ordinary stale or wrong knowledge use kb.invalidate instead, which keeps history. Give a reason that does not repeat the sensitive value.',
+        'Hard-delete a record permanently and run a full VACUUM so the content cannot be recovered from disk. Deleting an entity cascades to all of its statements and relationships. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not (the journal is the audit log itself). Use this ONLY for poisoned content — secrets, credentials, PII, or garbage that must not persist. For ordinary stale or wrong knowledge use kb.invalidate instead, which keeps history. Give a reason that does not repeat the sensitive value. If vacuum_completed is false in the result, the records are gone but the file vacuum was deferred because the database was busy.',
       inputSchema: kbDeleteShape,
     },
     (args) => wrap(() => api.delete(args)),

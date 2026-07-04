@@ -25,7 +25,7 @@ Use journal.append to record what you did, the commands you ran, and which state
 Statements are never edited in place. Use kb.edit_statement to create the replacement statement and invalidate the old one with a redirect, or use kb.invalidate when a statement should simply be retired. Invalid statements stay readable through memory.get and are searchable only when include_invalid is requested.
 
 6. Invalidate vs delete.
-Use kb.invalidate for stale, wrong, or superseded knowledge. Use kb.delete only for poisoned content such as leaked secrets, credentials, PII, or garbage that must not persist on disk. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not. Either way deletion runs a full VACUUM.
+Use kb.invalidate for stale, wrong, or superseded knowledge. Use kb.delete only for poisoned content such as leaked secrets, credentials, PII, or garbage that must not persist on disk. Deleting an entity also deletes all of its statements and relationships. Deleting a knowledge-base record writes an audit journal entry; deleting a journal entry does not. Either way deletion runs a full VACUUM.
 
 7. Secrets and PII.
 Do not store credentials, tokens, private keys, personal data, or copied sensitive output in statements or journals. If a command prints sensitive material, summarize only the safe lesson learned. If sensitive content is already stored, immediately use kb.delete with a reason that does not repeat the secret.
