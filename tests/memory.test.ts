@@ -136,6 +136,39 @@ describe('database initialization', () => {
     expect(journal.journal.length).toBeGreaterThan(0);
     reopened.close();
   });
+
+  it('re-runs the migration harmlessly when only the version stamp is stale', async () => {
+    const { dbFile, db, api } = makeApi();
+    const { statement } = await seedStatement(api);
+
+    // Worst case of a concurrent-migration race: the tables are already v2
+    // but this process still believes the schema is v1. The rebuild must be
+    // idempotent because it reads from the source tables, not the indexes.
+    db.pragma('user_version = 1');
+    db.close();
+
+    const reopened = openDb(dbFile);
+    expect(reopened.pragma('user_version', { simple: true })).toBe(2);
+    const mapped = reopened
+      .prepare(
+        `SELECT COUNT(*) AS count FROM embedding e
+         JOIN vec_index v ON v.rowid = e.vec_rowid
+         WHERE v.owner_type = e.owner_type AND v.project_id IS NOT NULL`,
+      )
+      .get() as { count: number };
+    const total = reopened.prepare('SELECT COUNT(*) AS count FROM embedding').get() as { count: number };
+    expect(mapped.count).toBe(total.count);
+
+    const migrated = new MemoryApi({
+      db: reopened,
+      resolver: new ProjectResolver(reopened, process.cwd()),
+      embeddings: new HashEmbeddings(),
+      dbFile,
+    });
+    const kb = await migrated.search({ query: 'Node 20', where: 'knowledge-base' });
+    expect(kb.entities.flatMap((group) => group.statements.map((hit) => hit.id))).toContain(statement.id);
+    reopened.close();
+  });
 });
 
 describe('tool contracts', () => {

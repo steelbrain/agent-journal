@@ -1,18 +1,32 @@
 import type Database from 'better-sqlite3';
+import { withRetry } from '../util/retry.js';
 
 const VERSION = 2;
 
 export function runMigrations(db: Database.Database): void {
-  const current = db.pragma('user_version', { simple: true }) as number;
-  if (current >= VERSION) {
+  if ((db.pragma('user_version', { simple: true }) as number) >= VERSION) {
     return;
   }
 
-  db.transaction(() => {
-    if (current < 1) migrateV1(db);
-    if (current < 2) migrateV2(db);
-    db.pragma(`user_version = ${VERSION}`);
-  })();
+  // Multiple server processes can race to migrate the shared database on the
+  // first start after an upgrade. BEGIN IMMEDIATE takes the write lock up
+  // front (a deferred transaction could fail with SQLITE_BUSY_SNAPSHOT when
+  // upgrading a stale read snapshot), the version is re-read under that lock
+  // so a losing process skips instead of re-migrating, and lock contention is
+  // retried with backoff on top of the connection's busy_timeout.
+  withRetry(() =>
+    db
+      .transaction(() => {
+        const current = db.pragma('user_version', { simple: true }) as number;
+        if (current >= VERSION) {
+          return;
+        }
+        if (current < 1) migrateV1(db);
+        if (current < 2) migrateV2(db);
+        db.pragma(`user_version = ${VERSION}`);
+      })
+      .immediate(),
+  );
 }
 
 function migrateV1(db: Database.Database): void {

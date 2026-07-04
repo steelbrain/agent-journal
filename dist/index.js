@@ -11,18 +11,48 @@ import path2 from "node:path";
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 
+// src/util/retry.ts
+var MAX_ATTEMPTS = 5;
+function isBusyError(err) {
+  return typeof err === "object" && err !== null && "code" in err && (err.code === "SQLITE_BUSY" || err.code === "SQLITE_BUSY_SNAPSHOT");
+}
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, ms);
+}
+function withRetry(fn) {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return fn();
+    } catch (err) {
+      if (!isBusyError(err) || attempt === MAX_ATTEMPTS - 1) {
+        throw err;
+      }
+      const backoff = 50 * 2 ** attempt + Math.floor(Math.random() * 26);
+      sleepSync(backoff);
+    }
+  }
+  throw new Error("unreachable retry state");
+}
+
 // src/db/migrations.ts
 var VERSION = 2;
 function runMigrations(db) {
-  const current = db.pragma("user_version", { simple: true });
-  if (current >= VERSION) {
+  if (db.pragma("user_version", { simple: true }) >= VERSION) {
     return;
   }
-  db.transaction(() => {
-    if (current < 1) migrateV1(db);
-    if (current < 2) migrateV2(db);
-    db.pragma(`user_version = ${VERSION}`);
-  })();
+  withRetry(
+    () => db.transaction(() => {
+      const current = db.pragma("user_version", { simple: true });
+      if (current >= VERSION) {
+        return;
+      }
+      if (current < 1) migrateV1(db);
+      if (current < 2) migrateV2(db);
+      db.pragma(`user_version = ${VERSION}`);
+    }).immediate()
+  );
 }
 function migrateV1(db) {
   db.exec(`
@@ -1297,31 +1327,6 @@ Do not store credentials, tokens, private keys, personal data, or copied sensiti
 
 8. Project scoping.
 Memory is project-scoped and resolved automatically, in this order: an explicit project argument on the tool call; a per-repo config file; the normalized git remote origin URL; the main worktree path (so every worktree of one repo shares the same memory); then the absolute launch cwd when outside git. Pass project only when you deliberately want to read or write another project's memory. Per-repository config lives under XDG_CONFIG_DIR, XDG_CONFIG_HOME, or ~/.config in the agent-memory directory as project_<sha256(repo-key)>.json and can pin the project or tune ranking config.`;
-
-// src/util/retry.ts
-var MAX_ATTEMPTS = 5;
-function isBusyError(err) {
-  return typeof err === "object" && err !== null && "code" in err && (err.code === "SQLITE_BUSY" || err.code === "SQLITE_BUSY_SNAPSHOT");
-}
-function sleepSync(ms) {
-  const sab = new SharedArrayBuffer(4);
-  const view = new Int32Array(sab);
-  Atomics.wait(view, 0, 0, ms);
-}
-function withRetry(fn) {
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return fn();
-    } catch (err) {
-      if (!isBusyError(err) || attempt === MAX_ATTEMPTS - 1) {
-        throw err;
-      }
-      const backoff = 50 * 2 ** attempt + Math.floor(Math.random() * 26);
-      sleepSync(backoff);
-    }
-  }
-  throw new Error("unreachable retry state");
-}
 
 // src/tools/api.ts
 function statementDocumentText(claim, entityTitle) {

@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project and per store instead of to one global pool, and invalidated
   tombstones stop consuming recall slots unless `include_invalid` is set.
   Existing databases migrate automatically; vectors are copied without
-  re-embedding.
+  re-embedding. The migration takes the write lock up front and re-checks the
+  schema version under it, so concurrent first starts after an upgrade cannot
+  race, and the rebuild is idempotent in any case.
 - `kb.upsert_entity` title changes now re-embed the entity's statements so
   semantic search reflects the new title (previously only keyword search was
   re-synced).
