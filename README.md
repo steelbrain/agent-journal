@@ -50,6 +50,20 @@ This project has an `agent-journal` MCP server providing a persistent knowledge 
 
 The server also returns this same text from `memory.agents_md_snippet`.
 
+## Markdown dump
+
+Dump the current project's memory to markdown files:
+
+```sh
+npx -y agent-journal --dump
+```
+
+This writes one file per entity (with its statements) to
+`.agents/knowledge-base/` and one file per UTC day to `.agents/journal/` in
+the current directory. Invalid records are included and clearly marked. The
+dump owns the `.md` files in those two directories — each run rewrites them,
+removing files for renamed or deleted records — but leaves other files alone.
+
 ## Storage
 
 The server stores data in `memory.db` under the app config directory by default.

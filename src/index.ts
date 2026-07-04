@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultDbPath, openDb } from './db/connection.js';
 import { TransformersEmbeddings } from './domain/embeddings.js';
 import { ProjectResolver } from './domain/project.js';
+import { dumpMemory } from './dump.js';
 import { createMcpServer, connectStdio } from './server.js';
 import { MemoryApi } from './tools/api.js';
 
@@ -46,6 +48,8 @@ Or add this server entry to your client's MCP config file (commonly .mcp.json):
 
 Options:
   --mcp            Run as an MCP server
+  --dump           Write the current project's knowledge base and journal to
+                   .agents/knowledge-base and .agents/journal as markdown
   -h, --help       Show this help text
   -v, --version    Print the version
 
@@ -54,6 +58,24 @@ Environment:
                      app config directory)
 
 Docs: https://github.com/steelbrain/agent-journal#readme`;
+}
+
+function runDump(): void {
+  const db = openDb(defaultDbPath());
+  try {
+    const resolver = new ProjectResolver(db, process.cwd());
+    const result = dumpMemory(db, resolver, process.cwd());
+    process.stdout.write(
+      `Dumped ${result.entities} entities with ${result.statements} statements, ` +
+        `${result.journalEntries} journal entries` +
+        `${result.relationships > 0 ? `, ${result.relationships} relationships` : ''} ` +
+        `(${result.filesWritten} files).\n` +
+        `  ${path.relative(process.cwd(), result.kbDir) || result.kbDir}\n` +
+        `  ${path.relative(process.cwd(), result.journalDir) || result.journalDir}\n`,
+    );
+  } finally {
+    db.close();
+  }
 }
 
 async function serve(version: string): Promise<void> {
@@ -76,6 +98,11 @@ async function main(): Promise<void> {
 
   if (args.includes('-v') || args.includes('--version')) {
     process.stdout.write(`${version}\n`);
+    return;
+  }
+
+  if (args.includes('--dump')) {
+    runDump();
     return;
   }
 
