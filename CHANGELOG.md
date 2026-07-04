@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-04
+
 ### Added
 
 - `agent-journal --dump` writes the current project's memory as markdown: one
@@ -68,5 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--mcp` flag to run as a server; bare invocation prints help and `--version`
   reports the version.
 
-[Unreleased]: https://github.com/steelbrain/agent-journal/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/steelbrain/agent-journal/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/steelbrain/agent-journal/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/steelbrain/agent-journal/releases/tag/v0.1.0
